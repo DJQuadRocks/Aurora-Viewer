@@ -721,6 +721,13 @@ fn sanitize(url: &str) -> String {
 }
 
 impl MediaManager {
+    /// World media prims a click should remember. Their faces are tested
+    /// apart from the pick index (`hit_test`), so a face on a moving
+    /// vehicle is still the one under the cursor a few frames later.
+    pub(crate) fn click_targets(&self) -> impl Iterator<Item = usize> + '_ {
+        self.objects.values().filter(|om| !om.hud).map(|om| om.idx)
+    }
+
     /// After a GPU recovery (app/gpu_recovery.rs): the media slots were the
     /// lost renderer's. Each one is made again, black, and its next frame
     /// fills it (`update`: a slot 0 is fresh).

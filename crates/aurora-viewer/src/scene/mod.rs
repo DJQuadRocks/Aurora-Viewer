@@ -15,6 +15,7 @@ pub mod blend_order;
 mod blender_live;
 pub mod body_physics;
 pub mod build_hologram;
+pub mod click_frame;
 pub mod complexity;
 pub mod creation_preview;
 pub(crate) mod default_motions;
@@ -1015,6 +1016,9 @@ pub struct Scene {
     /// Bounds of the objects for the hover search, and its kept answer
     /// (hover.rs).
     pick: hover::PickIndex,
+    /// Poses from the frame of a click, while that click runs again
+    /// (`click_frame.rs`, `app/click_pick.rs`).
+    pub(crate) click_frame: Option<click_frame::ClickFrame>,
     /// Drawn world volumes with the Ignore Object click action.
     ignored_draws: FastSet<usize>,
     pub hover: hover::HoverCache,
@@ -1813,6 +1817,7 @@ impl Scene {
             sync_budget: std::time::Duration::from_millis(1),
             geom_trash: Default::default(),
             pick: Default::default(),
+            click_frame: None,
             ignored_draws: Default::default(),
             hover: Default::default(),
             hud_own: Vec::new(),
