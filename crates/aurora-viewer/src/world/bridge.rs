@@ -111,6 +111,29 @@ fn legacy_bridge_name(name: &str) -> bool {
         })
 }
 
+/// The root folder a bridge of this name lives in: ours, or the Legacy
+/// Viewer's. The name alone is not a bridge.
+fn bridge_home(name: &str) -> Option<&'static str> {
+    if name == NAME {
+        Some(FOLDER)
+    } else if legacy_bridge_name(name) {
+        Some("#Firestorm")
+    } else {
+        None
+    }
+}
+
+/// Whether `item` is a viewer's scripting bridge owned by `owner`: ours in
+/// `#Aurora`, or the Legacy Viewer's in `#Firestorm`.
+fn bridge_item(inv: &super::inventory::Inventory, item: Uuid, owner: Uuid) -> bool {
+    inv.items.get(&item).is_some_and(|entry| {
+        entry.owner == owner
+            && entry.asset_type == 6
+            && bridge_home(&entry.name)
+                .is_some_and(|folder| root_folder(inv, folder).is_some_and(|folder| super::inventory::actions::under(inv, item, folder)))
+    })
+}
+
 /// Whether the inventory item is a viewer's scripting bridge: ours in
 /// `#Aurora`, or the one the Legacy Viewer left worn, in `#Firestorm`. The
 /// name alone is not enough: the agent owns it and it lies under the
@@ -118,20 +141,16 @@ fn legacy_bridge_name(name: &str) -> bool {
 /// wears on `point` (FSLSLBridge::isBridgeValid and getAttachedID, used by
 /// RlvHandler::onGetAttach and RlvForceWear::isForceDetachable).
 pub(crate) fn viewer_bridge(world: &World, item: Uuid, point: u8) -> bool {
-    let inv = &world.inventory;
-    point == POINT
-        && inv.items.get(&item).is_some_and(|entry| {
-            let folder = if entry.name == NAME {
-                FOLDER
-            } else if legacy_bridge_name(&entry.name) {
-                "#Firestorm"
-            } else {
-                return false;
-            };
-            entry.owner == world.agent_id
-                && entry.asset_type == 6
-                && root_folder(inv, folder).is_some_and(|folder| super::inventory::actions::under(inv, item, folder))
-        })
+    point == POINT && bridge_item(&world.inventory, item, world.agent_id)
+}
+
+/// The same item, for outfits. LLAppearanceMgr skips it when an outfit's
+/// links are made, puts it back when another outfit replaces the current
+/// one, and leaves it out of the size and changed checks (the bridge blocks
+/// in indra/newview/llappearancemgr.cpp). A bridge already linked in an
+/// outfit, ours or the Legacy Viewer's, is the same item.
+pub(crate) fn outfit_bridge(inv: &super::inventory::Inventory, item: Uuid) -> bool {
+    bridge_item(inv, item, inv.owner)
 }
 
 pub(crate) fn private_channel(key: Uuid) -> i32 {
