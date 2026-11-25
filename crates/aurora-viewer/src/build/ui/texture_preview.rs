@@ -988,16 +988,142 @@ mod tests {
                     "mask {owner_mask:#x}: still a choice after the preview"
                 );
                 click(&ctx, tool, world, env, 3.0, positions[aurora_i18n::tr!("common-ok")]);
+                // A single click is a choice: OK is enabled for a no-copy item
+                // too (LLFloaterTexturePicker::draw, `!getTentative()`), and
+                // only the apply is refused when several objects are selected
+                // (LLSelectMgr::selectionSetImage).
+                assert!(!tool.ui.picker.open, "mask {owner_mask:#x}: OK takes the choice");
                 if copyable {
-                    assert!(!tool.ui.picker.open, "mask {owner_mask:#x}: OK takes the choice");
                     for &idx in prims {
                         assert_eq!(texture(world, idx, 0), asset);
                     }
                 } else {
-                    // a no-copy item cannot go on several objects
-                    // (LLSelectMgr::selectionSetImage)
                     for (&idx, &texture_before) in prims.iter().zip(&before) {
                         assert_eq!(texture(world, idx, 0), texture_before);
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn a_click_under_a_tentative_material_picker_enables_ok_for_every_face() {
+        // The material field shows "Multiple" the same way the texture field
+        // does (LLPanelFace::updateUIGLTF's setTentative(!identical_pbr)).
+        // A single click on an inventory material is a choice: OK enables
+        // and applies it to every selected face. A no-copy material still
+        // enables OK and is not previewed onto several objects.
+        use crate::world::inventory::actions;
+        for owner_mask in [actions::FULL, actions::MODIFY | actions::TRANSFER] {
+            fixture(|world, tool, env, prims| {
+                let (root, item, asset) = (Uuid::from_u128(20), Uuid::from_u128(21), Uuid::from_u128(22));
+                world.inventory.root = root;
+                world.inventory.folders.insert(
+                    root,
+                    Folder {
+                        info: InvFolder {
+                            id: root,
+                            name: "Materials".into(),
+                            ..Default::default()
+                        },
+                        children: vec![],
+                        items: vec![item],
+                        state: FetchState::Fetched,
+                        library: false,
+                    },
+                );
+                world.inventory.items.insert(
+                    item,
+                    InvItem {
+                        id: item,
+                        parent: root,
+                        asset_id: asset,
+                        inv_type: 26,
+                        name: "A material".into(),
+                        owner: world.agent_id,
+                        owner_mask,
+                        ..Default::default()
+                    },
+                );
+                for (n, &idx) in prims.iter().enumerate() {
+                    let o = world.objects.get_mut(idx).unwrap();
+                    o.update_flags |= crate::ui::context::flags::OBJECT_YOU_OWNER;
+                    o.extra.render_materials.push((0, Uuid::from_u128(200 + n as u128)));
+                    let object = o.full_id;
+                    tool.props.insert(
+                        object,
+                        aurora_net::build::ObjectProps {
+                            object_id: object,
+                            full: true,
+                            ..Default::default()
+                        },
+                    );
+                    tool.contents_ready(world, idx);
+                    tool.on_task_inventory(world, object, Some(1), Vec::new());
+                }
+                let before: Vec<_> = prims.iter().map(|&idx| BuildTool::gltf_asset(world, idx, 0)).collect();
+                assert_ne!(before[0], before[1], "the faces start on different materials");
+                tool.ui.tex_tab = 1;
+                let ctx = egui::Context::default();
+                crate::theme::Theme::default().apply(&ctx, 1.0);
+                let first = before[0].unwrap_or_default();
+                open_from_swatch(tool, PickTarget::PbrMaterial, first);
+                // The Texture tab is drawn in the same pass as the picker, both
+                // styles' material swatch included: it must not put "Multiple"
+                // back over a choice.
+                let mut settings = crate::build::BuildSettings::default();
+                let copyable = owner_mask & actions::COPY != 0;
+                for legacy in [false, true] {
+                    let positions = material_frames(&ctx, tool, world, env, &mut settings, 0.0, vec![], legacy, 8);
+                    assert!(
+                        tool.ui.picker.open && tool.ui.picker.tentative(),
+                        "mask {owner_mask:#x} legacy {legacy}: the faces differ"
+                    );
+                    let row = positions["A material"];
+                    material_click(&ctx, tool, world, env, &mut settings, 1.0, row, legacy);
+                    assert!(
+                        tool.ui.picker.open && !tool.ui.picker.tentative(),
+                        "mask {owner_mask:#x} legacy {legacy}: a single click is a choice"
+                    );
+                    for (&idx, before_asset) in prims.iter().zip(&before) {
+                        let now = BuildTool::gltf_asset(world, idx, 0);
+                        let expected = if copyable { Some(asset) } else { *before_asset };
+                        assert_eq!(now, expected, "mask {owner_mask:#x} legacy {legacy}");
+                    }
+                    let positions = material_frames(&ctx, tool, world, env, &mut settings, 2.0, vec![], legacy, 8);
+                    assert!(
+                        !tool.ui.picker.tentative(),
+                        "mask {owner_mask:#x} legacy {legacy}: the Texture tab leaves the choice"
+                    );
+                    material_click(
+                        &ctx,
+                        tool,
+                        world,
+                        env,
+                        &mut settings,
+                        3.0,
+                        positions[aurora_i18n::tr!("common-ok")],
+                        legacy,
+                    );
+                    assert!(!tool.ui.picker.open, "mask {owner_mask:#x} legacy {legacy}: OK takes the choice");
+                    if copyable {
+                        for &idx in prims {
+                            assert_eq!(BuildTool::gltf_asset(world, idx, 0), Some(asset));
+                        }
+                    } else {
+                        for (&idx, before_asset) in prims.iter().zip(&before) {
+                            assert_eq!(BuildTool::gltf_asset(world, idx, 0), *before_asset);
+                        }
+                    }
+                    // The second style starts from the same mixed faces.
+                    if !legacy {
+                        for (n, &idx) in prims.iter().enumerate() {
+                            let o = world.objects.get_mut(idx).unwrap();
+                            o.extra.render_materials.retain(|(face, _)| *face != 0);
+                            o.extra.render_materials.push((0, Uuid::from_u128(200 + n as u128)));
+                        }
+                        let first = BuildTool::gltf_asset(world, prims[0], 0).unwrap_or_default();
+                        open_from_swatch(tool, PickTarget::PbrMaterial, first);
                     }
                 }
             });
@@ -1548,6 +1674,104 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// One pass of the Texture tab (Aurora or Legacy style) and the picker.
+    fn material_frame(
+        ctx: &egui::Context,
+        tool: &mut BuildTool,
+        world: &mut World,
+        env: &mut Env,
+        settings: &mut crate::build::BuildSettings,
+        time: f64,
+        events: Vec<egui::Event>,
+        legacy: bool,
+    ) -> HashMap<String, egui::Pos2> {
+        let p = crate::theme::Theme::default().palette();
+        settings.legacy_window = legacy;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                if legacy {
+                    ui.scope_builder(
+                        egui::UiBuilder::new().ui_stack_info(egui::UiStackInfo::default().with_tag("legacy-construction-layout")),
+                        |ui| {
+                            super::super::texture::show(ui, &p, tool, world, settings, env);
+                        },
+                    );
+                } else {
+                    super::super::texture::show(ui, &p, tool, world, settings, env);
+                }
+                show(ctx, &p, tool, world, env);
+            },
+        );
+        output.textures_delta.clear();
+        output
+            .shapes
+            .into_iter()
+            .filter_map(|s| {
+                if let egui::Shape::Text(t) = s.shape {
+                    Some((t.galley.text().to_owned(), t.pos + t.galley.size() * 0.5))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn material_frames(
+        ctx: &egui::Context,
+        tool: &mut BuildTool,
+        world: &mut World,
+        env: &mut Env,
+        settings: &mut crate::build::BuildSettings,
+        time: f64,
+        events: Vec<egui::Event>,
+        legacy: bool,
+        count: usize,
+    ) -> HashMap<String, egui::Pos2> {
+        let mut positions = HashMap::new();
+        for i in 0..count {
+            positions = material_frame(ctx, tool, world, env, settings, time + i as f64 / 60.0, events.clone(), legacy);
+        }
+        positions
+    }
+
+    fn material_click(
+        ctx: &egui::Context,
+        tool: &mut BuildTool,
+        world: &mut World,
+        env: &mut Env,
+        settings: &mut crate::build::BuildSettings,
+        time: f64,
+        pos: egui::Pos2,
+        legacy: bool,
+    ) {
+        for (step, pressed) in [true, false].into_iter().enumerate() {
+            material_frame(
+                ctx,
+                tool,
+                world,
+                env,
+                settings,
+                time + step as f64 / 60.0,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                legacy,
+            );
+        }
     }
 
     fn click(ctx: &egui::Context, tool: &mut BuildTool, world: &mut World, env: &mut Env, time: f64, pos: egui::Pos2) {
