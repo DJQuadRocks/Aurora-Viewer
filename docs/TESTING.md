@@ -11123,6 +11123,16 @@ Human grid validation: remember MFA for account A and B, restart the viewer, the
   folder windows, shared copy/cut/paste, links, delete, grouping and favourites.
   Changes to an active listing ask for confirmation; paste checks sale
   permissions, stock compatibility and hierarchy limits again when confirmed.
+  Inventory also offers "Copy to Marketplace listings…" (1 to 100 separate
+  copies, one at a time, with a "Create listings" box), plus "Copy to
+  Marketplace listings and create listing" and "Move to Marketplace listings
+  and create listing". On All and Unassociated, a multi-selection's Create
+  listing and "Create listings for all unassociated" queue one POST /listings
+  per folder: progress shows n of m, Cancel drops what has not started, the
+  requests are 5 to 8 seconds apart, and HTTP 429 or 503 backs off and retries
+  that folder. New listings stay unlisted. A refused folder is reported and
+  the queue continues. The demo server can answer one create with a rate
+  limit in tests; the sample merchant already has the unassociated lantern.
 - **`AURORA_DEMO_PLACE_WINDOW=1`**: with `AURORA_DEMO_PLACE`, the separate
   place windows instead of "Places" ("Landmarks and place
   profiles" option, not saved).

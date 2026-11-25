@@ -13,6 +13,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+pub mod batch;
+pub mod copy_queue;
 pub mod demo;
 #[cfg(test)]
 mod tests;
@@ -164,6 +166,8 @@ pub enum Alert {
     ActivateRequired,
     /// AlertMerchantVersionFolderEmpty.
     VersionEmpty,
+    /// A listing request was told to wait (HTTP 429 or 503).
+    RateLimited,
 }
 
 /// The listing folders that may neither move nor go to the Trash, kept in
@@ -560,6 +564,14 @@ impl MarketplaceData {
         true
     }
 
+    /// A 429 or 503 on a request this queue still owns: stop the updating
+    /// mark without the failure alert. The batch decides whether to retry.
+    pub fn note_rate_limit(&mut self, request: &SlmRequest) {
+        for folder in request.folders() {
+            self.set_updating(folder, false);
+        }
+    }
+
     fn send(&mut self, request: SlmRequest) {
         for folder in request.folders() {
             self.set_updating(folder, true);
@@ -597,6 +609,11 @@ impl MarketplaceData {
                     self.fetch = Fetch::Failed;
                 }
                 self.alerts.push(Alert::Failed(error));
+                return;
+            }
+            SlmReply::RateLimited => {
+                log::warn!("SLM {} rate limited", request.name());
+                self.alerts.push(Alert::RateLimited);
                 return;
             }
         };

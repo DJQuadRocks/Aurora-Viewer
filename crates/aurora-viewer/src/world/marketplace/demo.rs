@@ -49,6 +49,9 @@ pub struct DemoSlm {
     pub seeded: bool,
     listings: Vec<Listing>,
     next: i32,
+    /// Creates that answer 429 before a listing is stored. Tests set it;
+    /// the demo starts at zero.
+    pub rate_limits_left: u32,
 }
 
 fn edit_url(id: i32) -> String {
@@ -75,6 +78,7 @@ impl DemoSlm {
                 listing(4103, DRAFT, DRAFT_VERSION, false, -1),
             ],
             next: 4104,
+            rate_limits_left: 0,
         }
     }
 
@@ -106,6 +110,10 @@ impl DemoSlm {
             SlmRequest::Create {
                 folder, version, count, ..
             } => {
+                if self.rate_limits_left > 0 {
+                    self.rate_limits_left -= 1;
+                    return SlmReply::RateLimited;
+                }
                 let l = Listing {
                     id: self.next,
                     is_listed: false,

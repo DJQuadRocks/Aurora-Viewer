@@ -201,6 +201,12 @@ impl InventoryUi {
         self.pending.is_some() || !self.copy_jobs.is_empty()
     }
 
+    /// The inventory lock the Marketplace copy queue waits on: one change at
+    /// a time, including a copy that is still arriving.
+    pub fn mutation_busy(&self) -> bool {
+        self.busy()
+    }
+
     pub fn finish_mutation(&mut self, success: bool) {
         self.pending = None;
         self.progress = None;

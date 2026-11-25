@@ -12,6 +12,8 @@ use super::widgets::{self, ActionKind, Floater, Modal};
 use crate::theme::Palette;
 use crate::world::inventory::actions::{request_tree, under};
 use crate::world::inventory::{FetchState, Inventory};
+use crate::world::marketplace::batch::CreateQueue;
+use crate::world::marketplace::copy_queue::CopyPump;
 use crate::world::marketplace::validate::{self, Level, Message};
 use crate::world::marketplace::{self as mp, Alert, Fetch, MarketplaceData, STOCK, STOCK_INFINITE, STOCK_NOT_EVALUATED, Status};
 use aurora_net::inventory::operations::{Mutation, Operation};
@@ -22,7 +24,7 @@ use uuid::Uuid;
 
 pub const WINDOW: &str = "marketplace_listings";
 mod commands;
-pub use commands::{Command, OptionState};
+pub use commands::{Command, OptionState, bulk_create_folders};
 const AUDIT_WINDOW: &str = "marketplace_validation";
 /// MarketplaceURL_CreateStore (strings.xml): the knowledge base page on
 /// opening a store, outside the Marketplace.
@@ -162,12 +164,53 @@ pub struct ListingsUi {
     reconciled: u64,
     demo_audited: bool,
     demo_menu: Option<Uuid>,
+    /// Repeated copies and moves into Marketplace listings, one at a time.
+    pub(crate) copy_pump: CopyPump,
+    /// Staggered POST /listings. Listings stay unlisted.
+    pub(crate) creates: CreateQueue,
+    /// Mixer state for the 5–8 s pause between listing creates.
+    gap_state: u64,
+}
+
+/// How one folder's "Create listing" started.
+#[derive(Debug)]
+pub(crate) enum CreateStart {
+    /// POST /listings is in the outbox. The listing is not activated.
+    Sent,
+    /// The folder already has a listing.
+    AlreadyListed,
+    /// The audit refused it. No request was sent.
+    Failed(String),
 }
 
 impl ListingsUi {
     /// Whether `prompt` is still asked; a silenced one answers OK.
     fn asks(&self, prompt: Prompt) -> bool {
         !self.silenced.contains(&prompt)
+    }
+
+    pub(crate) fn holds_question(&self) -> bool {
+        self.confirm.is_some()
+    }
+
+    /// The next pause between two POST /listings, from 5 to 8 seconds.
+    pub(crate) fn next_gap(&mut self) -> std::time::Duration {
+        // SplitMix64. The queue applies the duration; nothing sleeps here.
+        self.gap_state = self.gap_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.gap_state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        std::time::Duration::from_secs(mp::batch::gap_seconds(z))
+    }
+
+    /// Listing folders under the root that have no listing yet.
+    pub(crate) fn unassociated_folders(&self, inv: &Inventory, root: Uuid) -> Vec<Uuid> {
+        mp::subfolders(inv, root)
+            .iter()
+            .copied()
+            .filter(|id| inv.folders.contains_key(id) && !self.data.is_listed(*id))
+            .collect()
     }
 }
 
@@ -284,6 +327,7 @@ pub fn alert_text(alert: &Alert) -> (String, Option<String>) {
         ),
         Alert::ActivateRequired => (aurora_i18n::tr!("marketplace-alert-activate-required").into(), None),
         Alert::VersionEmpty => (aurora_i18n::tr!("marketplace-alert-version-empty").into(), None),
+        Alert::RateLimited => (aurora_i18n::tr!("marketplace-alert-rate-limited").into(), None),
     }
 }
 
@@ -553,6 +597,8 @@ impl ListingsUi {
         count: usize,
         actions: &mut Vec<Action>,
     ) {
+        self.batch_status(ui, p);
+        let offer_bulk = matches!(TABS.get(self.tab).copied(), Some(Tab::All | Tab::Unassociated));
         ui.horizontal(|ui| {
             // LLPanelMarketplaceListings::onAddButtonClicked
             if widgets::icon_button(ui, p, "plus", aurora_i18n::tr!("marketplace-listings-new-folder"), true) {
@@ -580,14 +626,86 @@ impl ListingsUi {
             {
                 actions.push(Action::OpenMarketplace(dashboard(home)));
             }
+            if offer_bulk {
+                let folders = self.unassociated_folders(inv, root);
+                let enabled = !folders.is_empty() && self.data.is_merchant() && self.data.fetch() == Fetch::Done;
+                if widgets::action_button_if(
+                    ui,
+                    p,
+                    "tag-filled",
+                    aurora_i18n::tr!("marketplace-create-all-unassociated"),
+                    ActionKind::Flat,
+                    Vec2::new(0.0, 28.0),
+                    enabled,
+                )
+                .clicked()
+                {
+                    self.creates.push(folders);
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.message.is_empty() {
-                    tree::status_text(ui, &aurora_i18n::tr!("marketplace-listings-count", count = count), p.muted);
-                } else {
+                if !self.message.is_empty() {
                     tree::status_text(ui, &self.message, p.warn);
+                } else if self.creates.waiting(std::time::Instant::now()) {
+                    tree::status_text(ui, aurora_i18n::tr!("marketplace-create-waiting"), p.muted);
+                } else {
+                    tree::status_text(ui, &aurora_i18n::tr!("marketplace-listings-count", count = count), p.muted);
                 }
             });
         });
+    }
+
+    /// Copy and create progress, with Cancel for what has not started.
+    fn batch_status(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let copy = self.copy_pump.progress();
+        let create = self.creates.progress();
+        if copy.is_none() && create.is_none() {
+            return;
+        }
+        if let Some((done, total)) = copy {
+            ui.horizontal(|ui| {
+                let text = aurora_i18n::tr!("marketplace-copy-progress", done = done, total = total);
+                widgets::progress(ui, p, "marketplace-copy-progress", done as f32 / total as f32, 160.0, &text, None);
+                if widgets::action_button(
+                    ui,
+                    p,
+                    "x",
+                    aurora_i18n::tr!("common-cancel"),
+                    ActionKind::Flat,
+                    Vec2::new(0.0, 28.0),
+                )
+                .clicked()
+                {
+                    self.copy_pump.cancel();
+                }
+            });
+        }
+        if let Some((done, total)) = create {
+            ui.horizontal(|ui| {
+                let text = aurora_i18n::tr!("marketplace-create-progress", done = done, total = total);
+                widgets::progress(
+                    ui,
+                    p,
+                    "marketplace-create-progress",
+                    done as f32 / total.max(1) as f32,
+                    160.0,
+                    &text,
+                    None,
+                );
+                if widgets::action_button(
+                    ui,
+                    p,
+                    "x",
+                    aurora_i18n::tr!("common-cancel"),
+                    ActionKind::Flat,
+                    Vec2::new(0.0, 28.0),
+                )
+                .clicked()
+                {
+                    self.creates.cancel();
+                }
+            });
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -709,10 +827,12 @@ impl ListingsUi {
                 panel.drag_source(ui, item, false, &response);
                 panel.interact(ui, inv, item, &response);
                 super::menu::context_menu(&response, p, |ui| {
-                    panel
-                        .state
-                        .marketplace_commands
-                        .insert(item, self.inventory_commands(inv, root, item));
+                    for sid in panel.state.selected_ids(item) {
+                        panel
+                            .state
+                            .marketplace_commands
+                            .insert(sid, self.inventory_commands(inv, root, sid));
+                    }
                     let pending = panel.state.pending;
                     if self.data.is_updating(inv, root, item) {
                         panel.state.pending = Some(Uuid::nil());
@@ -741,12 +861,34 @@ impl ListingsUi {
     }
 
     /// marketplace_create_listing: an audit, then one that fixes, then the
-    /// listing.
+    /// listing. The Legacy Viewer creates the listing before the inventory
+    /// answers, and does not activate it.
     fn create_listing(&mut self, inv: &Inventory, worn: &HashSet<Uuid>, root: Uuid, id: Uuid, actions: &mut Vec<Action>) {
+        if let CreateStart::Failed(error) = self.begin_create(inv, worn, root, id, actions) {
+            actions.push(notify(&aurora_i18n::tr!("marketplace-alert-listing-failed", error = error)));
+        }
+    }
+
+    /// The same audit and POST /listings as one Create listing. A batch uses
+    /// the result so a refused folder does not stop the others.
+    pub(crate) fn begin_create(
+        &mut self,
+        inv: &Inventory,
+        worn: &HashSet<Uuid>,
+        root: Uuid,
+        id: Uuid,
+        actions: &mut Vec<Action>,
+    ) -> CreateStart {
+        if self.data.is_listed(id) {
+            return CreateStart::AlreadyListed;
+        }
         let first = validate::validate(inv, root, id, false, -1, worn);
         if first.ok {
-            self.data.create_listing(inv, root, id);
-            return;
+            return if self.data.create_listing(inv, root, id) {
+                CreateStart::Sent
+            } else {
+                CreateStart::AlreadyListed
+            };
         }
         let fixed = validate::validate(inv, root, id, true, -1, worn);
         if fixed.split {
@@ -759,12 +901,14 @@ impl ListingsUi {
         }
         if ok {
             actions.push(notify(aurora_i18n::tr!("marketplace-alert-force-validate")));
-            // the listing is created once the fixed folders are known
-            // (Firestorm creates it at once, before AIS answers)
-            self.data.create_listing(inv, root, id);
+            if self.data.create_listing(inv, root, id) {
+                CreateStart::Sent
+            } else {
+                CreateStart::AlreadyListed
+            }
         } else {
             let error = if errors.is_empty() { first.errors() } else { errors };
-            actions.push(notify(&aurora_i18n::tr!("marketplace-alert-listing-failed", error = error)));
+            CreateStart::Failed(error)
         }
     }
 
@@ -1176,6 +1320,22 @@ mod tests {
             ui.data.apply(inv, root, &request, reply, std::time::Instant::now());
         }
         ui
+    }
+
+    #[test]
+    fn a_copy_into_a_new_listing_folder_is_not_held_for_a_question() {
+        let inv = demo_inventory();
+        let mut ui = merchant(&inv);
+        let chair = Uuid::from_u128(8_400_110);
+        let change = rules::marketplace(
+            &inv,
+            &[chair],
+            true,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        )
+        .expect("copy");
+        assert!(ui.guard_inventory_change(&inv, change, false, false, Uuid::nil()).is_some());
     }
 
     #[test]

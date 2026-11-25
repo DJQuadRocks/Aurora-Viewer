@@ -648,3 +648,36 @@ fn the_demo_server_answers_like_slm() {
         MerchantStatus::ConnectionFailure(_)
     ));
 }
+
+#[test]
+fn a_rate_limit_does_not_store_a_listing_and_the_next_create_is_another_id() {
+    let mut slm = demo::DemoSlm::new(demo::Mode::Merchant);
+    slm.rate_limits_left = 1;
+    let create = |folder| SlmRequest::Create {
+        folder,
+        name: "Lantern".into(),
+        version: Uuid::nil(),
+        count: -1,
+    };
+    assert_eq!(slm.answer(&create(demo::LANTERN)), SlmReply::RateLimited);
+    let SlmReply::Listings(first) = slm.answer(&create(demo::LANTERN)) else {
+        panic!("listing");
+    };
+    let SlmReply::Listings(second) = slm.answer(&create(id(90))) else {
+        panic!("listing");
+    };
+    assert!(!first[0].is_listed);
+    assert!(!second[0].is_listed);
+    assert_ne!(first[0].id, second[0].id);
+    let mut data = MarketplaceData::default();
+    data.set_status(MerchantStatus::Merchant);
+    let request = create(demo::LANTERN);
+    // A folder with no version raises ActivateRequired on its own. The
+    // rate-limit reply is what must not store a listing.
+    assert!(data.create_listing(&Inventory::default(), Uuid::nil(), demo::LANTERN));
+    let _ = data.take_alerts();
+    data.apply(&Inventory::default(), Uuid::nil(), &request, SlmReply::RateLimited, Instant::now());
+    assert!(data.record(demo::LANTERN).is_none());
+    assert!(!data.is_listed(demo::LANTERN));
+    assert_eq!(data.take_alerts(), vec![Alert::RateLimited]);
+}

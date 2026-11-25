@@ -129,6 +129,9 @@ impl Default for Profile {
                             "separator:marketplace",
                             "marketplace-copy",
                             "marketplace-move",
+                            "marketplace-copy-count",
+                            "marketplace-copy-create",
+                            "marketplace-move-create",
                             "separator:uploads",
                             "upload-folder",
                             "asset-uuid",
@@ -242,6 +245,9 @@ impl Profile {
             "new-outfit",
             "find-similar",
             "folder-color",
+            "marketplace-copy-count",
+            "marketplace-copy-create",
+            "marketplace-move-create",
         ] {
             let known = self.layout.placements.contains_key(id)
                 || self.layout.removed.contains(id)
@@ -317,6 +323,9 @@ impl Preferences {
                 ("recover-folder", "restore", TEXT),
                 ("copy-name", "image", "children:organize"),
                 ("find-similar", "find-links", "children:organize"),
+                ("marketplace-copy-count", "marketplace-move", "children:organize"),
+                ("marketplace-copy-create", "marketplace-copy-count", "children:organize"),
+                ("marketplace-move-create", "marketplace-copy-create", "children:organize"),
             ] {
                 let known = profile.layout.placements.contains_key(id)
                     || profile.layout.removed.contains(id)

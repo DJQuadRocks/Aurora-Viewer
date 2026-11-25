@@ -34,10 +34,12 @@ pub(super) async fn slm_request(http: &reqwest::Client, cap: Option<&str>, reque
             // an empty or non-JSON body reads as nothing (LLSD undefined)
             let body = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
             let reply = slm::reply(request, code, &reason, &body);
-            if let SlmReply::Failed(_) = &reply {
+            match &reply {
                 // log_SLM_warning: the request and the status, never the URL
                 // (it carries the capability)
-                log::warn!("SLM API: {} failed with status {code} {reason}", request.name());
+                SlmReply::Failed(_) => log::warn!("SLM API: {} failed with status {code} {reason}", request.name()),
+                SlmReply::RateLimited => log::warn!("SLM API: {} asked to wait (status {code})", request.name()),
+                _ => {}
             }
             reply
         }

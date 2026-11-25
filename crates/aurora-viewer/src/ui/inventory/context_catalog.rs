@@ -46,6 +46,10 @@ pub(super) enum Command {
     Favorite(Vec<Uuid>, bool),
     Worn(crate::ui::context::CtxAction),
     Marketplace(Vec<Uuid>, bool),
+    /// Opens the copy-count dialog. It does not change the inventory.
+    MarketplaceCopies(Vec<Uuid>),
+    /// One copy or move, then a listing for each new folder.
+    MarketplaceAndCreate(Vec<Uuid>, bool),
     Explorer(explorer::ExplorerCommand),
 }
 
@@ -960,26 +964,41 @@ fn build_mode(
     }
     if !trash || all {
         c.divider("marketplace", &organize);
-        for (copy, key, label) in [
+        let copy_ok = ready && st.merchant && rules::marketplace(inv, &ids, true, &prefs.protected, &facts.worn).is_ok();
+        let move_ok = ready && st.merchant && rules::marketplace(inv, &ids, false, &prefs.protected, &facts.worn).is_ok();
+        for (key, label, enabled, command) in [
             (
-                true,
                 "marketplace-copy",
                 aurora_i18n::tr!("ui-inventory-context-copy-to-marketplace-listings"),
+                copy_ok,
+                Command::Marketplace(ids.clone(), true),
             ),
             (
-                false,
                 "marketplace-move",
                 aurora_i18n::tr!("ui-inventory-context-move-to-marketplace-listings"),
+                move_ok,
+                Command::Marketplace(ids.clone(), false),
+            ),
+            (
+                "marketplace-copy-count",
+                aurora_i18n::tr!("ui-inventory-context-copy-to-marketplace-listings-count"),
+                copy_ok,
+                Command::MarketplaceCopies(ids.clone()),
+            ),
+            (
+                "marketplace-copy-create",
+                aurora_i18n::tr!("ui-inventory-context-copy-to-marketplace-listings-and-create"),
+                copy_ok,
+                Command::MarketplaceAndCreate(ids.clone(), true),
+            ),
+            (
+                "marketplace-move-create",
+                aurora_i18n::tr!("ui-inventory-context-move-to-marketplace-listings-and-create"),
+                move_ok,
+                Command::MarketplaceAndCreate(ids.clone(), false),
             ),
         ] {
-            c.add(
-                key,
-                &organize,
-                "tag-filled",
-                label,
-                ready && st.merchant && rules::marketplace(inv, &ids, copy, &prefs.protected, &facts.worn).is_ok(),
-                Command::Marketplace(ids.clone(), copy),
-            );
+            c.add(key, &organize, "tag-filled", label, enabled, command);
         }
         if folder.is_some() || all {
             c.divider("uploads", &organize);
@@ -1412,6 +1431,20 @@ pub(super) fn execute(
         }),
         Command::Worn(action) => crate::ui::context::request(ui.ctx(), action),
         Command::Marketplace(ids, copy) => submit(rules::marketplace(inv, &ids, copy, &prefs.protected, &facts.worn)),
+        Command::MarketplaceCopies(ids) => {
+            st.marketplace_copies = Some(super::dialogs::MarketplaceCopyDialog {
+                ids,
+                count: "1".into(),
+                create_listings: false,
+                error: false,
+            });
+        }
+        Command::MarketplaceAndCreate(ids, copy) => actions.push(InvAction::MarketplaceTransfer {
+            ids,
+            copy,
+            count: 1,
+            create_listings: true,
+        }),
         Command::Explorer(command) => explorer::execute(command, ui, inv, st, prefs, facts, actions),
     }
 }
@@ -1480,6 +1513,52 @@ mod tests {
     }
 
     #[test]
+    fn marketplace_copy_count_follows_the_copy_eligibility() {
+        let mut inv = Inventory::default();
+        let owner = Uuid::from_u128(2);
+        inv.root = Uuid::from_u128(1);
+        inv.owner = owner;
+        crate::world::inventory::demo::seed(&mut inv, owner);
+        let row = |merchant: bool, id: Uuid, key: &str| {
+            let mut st = InventoryUi {
+                merchant,
+                ..Default::default()
+            };
+            st.selection.insert(id);
+            let catalog = build(&inv, id, &st, &InventoryPreferences::default(), &facts());
+            catalog.entries.iter().find(|entry| entry.id == key).map(|entry| entry.enabled)
+        };
+        for key in [
+            "marketplace-copy",
+            "marketplace-move",
+            "marketplace-copy-count",
+            "marketplace-copy-create",
+            "marketplace-move-create",
+        ] {
+            assert_eq!(row(true, Uuid::from_u128(8100), key), Some(true), "{key}");
+            assert_eq!(row(false, Uuid::from_u128(8100), key), Some(false), "not a merchant: {key}");
+            assert_eq!(row(true, Uuid::from_u128(8110), key), Some(false), "no transfer: {key}");
+        }
+        for key in ["marketplace-copy", "marketplace-copy-count", "marketplace-copy-create"] {
+            assert_eq!(row(true, Uuid::from_u128(8109), key), Some(false), "no copy: {key}");
+        }
+        assert_eq!(row(true, Uuid::from_u128(8109), "marketplace-move"), Some(true));
+        assert_eq!(row(true, Uuid::from_u128(8109), "marketplace-move-create"), Some(true));
+        let mut st = InventoryUi {
+            merchant: true,
+            ..Default::default()
+        };
+        let id = Uuid::from_u128(8100);
+        st.selection.insert(id);
+        let catalog = build(&inv, id, &st, &InventoryPreferences::default(), &facts());
+        let entry = catalog.entries.iter().find(|entry| entry.id == "marketplace-copy-count").unwrap();
+        let Kind::Action(index) = entry.kind else { panic!("action") };
+        assert!(matches!(catalog.commands[index], Some(Command::MarketplaceCopies(_))));
+        let entry = catalog.entries.iter().find(|entry| entry.id == "marketplace-copy-create").unwrap();
+        let Kind::Action(index) = entry.kind else { panic!("action") };
+        assert!(matches!(catalog.commands[index], Some(Command::MarketplaceAndCreate(_, true))));
+    }
+
     fn the_parcel_save_row_is_greyed_while_rlva_holds_the_environment() {
         let mut inv = inventory();
         let item = Uuid::from_u128(8103);
