@@ -61,6 +61,10 @@ impl Backup {
         }
         let mut items = Vec::new();
         for link in links.into_iter().filter(|l| !l.folder) {
+            // makeNewOutfitLinks never stores a viewer bridge.
+            if super::bridge::outfit_bridge(inv, link.target) {
+                continue;
+            }
             let original = inv.items.get(&link.target);
             // Retain known broken links too, so a subsequent import reports
             // them rather than silently pretending the backup is complete.
@@ -169,6 +173,11 @@ impl Backup {
                     && saved.wearable_type.is_none_or(|kind| it.flags & 0xff == u32::from(kind))
             });
             if let Some(item) = item {
+                // An older file may still name a bridge. It is not an outfit
+                // item, and it is not reported missing.
+                if super::bridge::outfit_bridge(inv, item.id) {
+                    continue;
+                }
                 found.links.push(OutfitLink {
                     target: item.id,
                     name: item.name.clone(),
