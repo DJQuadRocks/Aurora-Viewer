@@ -4279,3 +4279,155 @@ fn one_selected_object_has_its_contents_listed_whatever_the_tab() {
     inspector.show(vec![]);
     assert_eq!(asked(&inspector.tool, object) + asked(&inspector.tool, other_id), 0);
 }
+
+/// Two objects, different diffuse textures, Blinn-Phong. The picker opens
+/// with the first texture highlighted and OK applies it to both, as
+/// LLFloaterTexturePicker::onSelectionChange does for the row postBuild
+/// selected (user_action false, then onBtnSelect).
+#[test]
+fn a_highlighted_diffuse_texture_enables_ok_for_two_objects() {
+    use super::super::PickTarget;
+    let _inline = crate::scene::jobs::execute_inline_on_this_thread();
+    let mut inspector = material_inspector();
+    inspector.tool.tab = 3;
+    inspector.tool.ui.tex_tab = 0;
+    inspector.settings.warn_live_preview = true;
+    let first = inspector.tool.sel_prims(&inspector.world)[0];
+    let second = (0..inspector.world.objects.len())
+        .find(|&i| {
+            i != first
+                && crate::build::root_of(&inspector.world, i) == i
+                && inspector.world.objects.get(i).is_some_and(|o| o.pcode == 9 && o.te.is_some())
+        })
+        .expect("a second prim");
+    inspector.world.objects.get_mut(second).unwrap().update_flags |=
+        crate::ui::context::flags::OBJECT_MOVE | crate::ui::context::flags::OBJECT_MODIFY | crate::ui::context::flags::OBJECT_YOU_OWNER;
+    inspector.world.objects.get_mut(first).unwrap().update_flags |= crate::ui::context::flags::OBJECT_YOU_OWNER;
+    inspector
+        .tool
+        .click_select(&mut inspector.world, &inspector.settings, Some(second), true);
+    assert_eq!(inspector.tool.roots(&inspector.world).len(), 2, "both cubes stay selected");
+    let asset_a = uuid::Uuid::from_u128(0x4199_000a);
+    let asset_b = uuid::Uuid::from_u128(0x4199_000b);
+    for (idx, asset) in [(first, asset_a), (second, asset_b)] {
+        let object = inspector.world.objects.get_mut(idx).unwrap();
+        object.extra.render_materials.clear();
+        let mut te = object.te.as_deref().unwrap().clone();
+        for face in &mut te.faces {
+            face.texture = asset;
+        }
+        object.te = Some(std::sync::Arc::new(te));
+    }
+    let root = uuid::Uuid::from_u128(0x4199_0001);
+    inspector.world.inventory.root = root;
+    inspector.world.inventory.created_folders(vec![aurora_net::inventory::InvFolder {
+        id: root,
+        name: "Inventory".into(),
+        type_default: -1,
+        ..Default::default()
+    }]);
+    let full = crate::world::inventory::actions::FULL;
+    let agent = inspector.world.agent_id;
+    for (id, asset, name) in [
+        (uuid::Uuid::from_u128(0x4199_0010), asset_a, "First texture"),
+        (uuid::Uuid::from_u128(0x4199_0011), asset_b, "Second texture"),
+    ] {
+        inspector.world.inventory.add_items(vec![aurora_net::inventory::InvItem {
+            id,
+            parent: root,
+            asset_id: asset,
+            name: name.into(),
+            inv_type: 0,
+            asset_type: 0,
+            owner: agent,
+            owner_mask: full,
+            base_mask: full,
+            everyone_mask: full,
+            next_owner_mask: full,
+            group_mask: full,
+            ..Default::default()
+        }]);
+    }
+
+    fn step(inspector: &mut Inspector, events: Vec<egui::Event>) -> Vec<(String, egui::Rect)> {
+        inspector.tool.update(
+            &mut inspector.world,
+            &inspector.settings,
+            Some(&inspector.scene),
+            (0.0, 0.0),
+            true,
+            crate::build::Mods::default(),
+        );
+        inspector.show(events).1
+    }
+    fn click(inspector: &mut Inspector, pos: egui::Pos2) {
+        let pressed_at = pos - egui::vec2(3.0, 2.0);
+        step(
+            inspector,
+            vec![
+                egui::Event::PointerMoved(pressed_at),
+                egui::Event::PointerButton {
+                    pos: pressed_at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+    }
+    fn diffuse(inspector: &Inspector, idx: usize) -> uuid::Uuid {
+        inspector.world.objects.get(idx).unwrap().te.as_ref().unwrap().face(0).texture
+    }
+
+    for _ in 0..6 {
+        step(&mut inspector, vec![]);
+    }
+    inspector.tool.ui.tex_tab = 0;
+    step(&mut inspector, vec![]);
+    let swatch = inspector.ctx.data(|d| {
+        d.get_temp::<egui::Rect>(egui::Id::unique(("material_preview", format!("{:?}", PickTarget::Diffuse))))
+            .expect("the Diffuse swatch is on the Texture tab")
+    });
+    click(&mut inspector, swatch.center());
+    let mut row = None;
+    for _ in 0..12 {
+        step(&mut inspector, vec![]);
+        row = inspector
+            .ctx
+            .data(|d| d.get_temp::<(egui::Rect, egui::Rect)>(egui::Id::unique("picker_selected_row")));
+        if row.is_some() && inspector.tool.ui.picker.open {
+            break;
+        }
+    }
+    let (row, clip) = row.expect("the first object's texture is highlighted");
+    assert!(clip.contains(row.center()), "highlighted row is on screen");
+    assert!(inspector.tool.ui.picker.open);
+    assert_eq!(diffuse(&inspector, first), asset_a, "opening does not apply the texture");
+    assert_eq!(diffuse(&inspector, second), asset_b);
+    let highlighted = inspector.tool.ui.picker.shown().expect("the first face's texture");
+    assert!(
+        highlighted == asset_a || highlighted == asset_b,
+        "the highlight is one of the two textures"
+    );
+    assert!(
+        !inspector.tool.ui.picker.tentative(),
+        "OK is enabled for the texture the picker already highlights"
+    );
+    let labels = step(&mut inspector, vec![]);
+    let ok = labels
+        .iter()
+        .find(|(text, _)| text == aurora_i18n::tr!("common-ok"))
+        .map(|(_, rect)| rect.center())
+        .expect("OK is drawn");
+    click(&mut inspector, ok);
+    assert!(!inspector.tool.ui.picker.open, "OK applies the highlighted texture");
+    assert_eq!(diffuse(&inspector, first), highlighted);
+    assert_eq!(diffuse(&inspector, second), highlighted);
+}

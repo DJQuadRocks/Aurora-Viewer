@@ -152,11 +152,14 @@ pub struct TexturePicker {
     original: Uuid,
     live_value: Uuid,
     cancelled: bool,
-    /// The targets hold different values and nothing was chosen since: the
-    /// preview is marked "Multiple" and OK waits for a choice
+    /// The targets hold different values and the highlighted inventory row
+    /// has not been reported yet: the preview says "Multiple" and OK waits
     /// (LLUICtrl::setTentative on LLTextureCtrl and its floater,
-    /// indra/newview/lltexturectrl.cpp).
+    /// indra/newview/lltexturectrl.cpp). The row postBuild selects clears it.
     tentative: bool,
+    /// `open` or `follow` showed this asset. Once its inventory row is
+    /// highlighted, `tentative` clears without a preview.
+    highlight_confirms: bool,
     /// The value comes from Default, Blank, Transparent or None: no
     /// inventory item stands behind it, even one that holds the same asset
     /// (LLFloaterTexturePicker::onBtnSetToDefault, onBtnBlank, onBtnNone:
@@ -313,6 +316,7 @@ impl TexturePicker {
         self.live_value = current;
         self.cancelled = false;
         self.tentative = false;
+        self.highlight_confirms = !current.is_nil();
         self.preset = false;
         self.generation = self.generation.wrapping_add(1);
     }
@@ -411,14 +415,16 @@ impl TexturePicker {
         self.select(current, None, false);
         self.selected = selected;
         self.selected_lookup = None;
+        self.highlight_confirms = selected.is_some();
         self.tree.opened(current);
         self.source = 0;
         self.reveal_selection = true;
     }
 
     /// LLTextureCtrl::setTentative: `current` stands for targets whose values
-    /// differ (the first one's). Set after `open` or `follow`; any choice made
-    /// in the picker clears it (LLFloaterTexturePicker::setImageIDFromItem,
+    /// differ (the first one's). Set after `open` or `follow`. The inventory
+    /// row that highlight selects then clears it, as does any choice made in
+    /// the picker (LLFloaterTexturePicker::setImageIDFromItem,
     /// onBtnSetToDefault, onBtnBlank, onBtnNone, onPipetteSelect).
     pub(crate) fn set_tentative(&mut self, tentative: bool) {
         self.tentative = tentative;
@@ -536,6 +542,20 @@ impl TexturePicker {
                         .min()
                 });
             }
+        }
+        if self.highlight_confirms
+            && self
+                .selected_item
+                .is_some_and(|id| inventory_asset(&world.inventory, id, self.materials) == self.selected)
+        {
+            // LLFloaterTexturePicker::postBuild selects the current asset with
+            // TAKE_FOCUS_NO before the select callback is installed.
+            // LLFolderView::update then signals that selection
+            // (mSelectSignal, user_action false). onSelectionChange calls
+            // setImageIDFromItem, which setTentative(false), and skips
+            // commitIfImmediateSet, so the highlighted item is not previewed.
+            self.tentative = false;
+            self.highlight_confirms = false;
         }
         // Keep an explicit source choice between controls. Without a preference,
         // reveal the current asset as LLFloaterTexturePicker::setImageID does;
@@ -1272,6 +1292,80 @@ pub(crate) mod tests {
         // a new opening starts clean
         picker.open("Texture", first);
         assert!(!picker.tentative() && picker.can_confirm(&inv, agent));
+    }
+
+    #[test]
+    fn a_highlighted_inventory_texture_enables_ok_without_a_click() {
+        // LLFloaterTexturePicker::postBuild selects the current asset with
+        // TAKE_FOCUS_NO. LLFolderView::update then signals onSelectionChange
+        // with user_action false, and setImageIDFromItem calls
+        // setTentative(false) without previewing. OK applies that row.
+        let mut world = World::new(std::sync::Arc::new(crate::scene::avatar::AvatarLibrary::load()));
+        let agent = Uuid::from_u128(0xd0);
+        world.agent_id = agent;
+        let root = Uuid::from_u128(0x4199_0001);
+        world.inventory.root = root;
+        world.inventory.created_folders(vec![aurora_net::inventory::InvFolder {
+            id: root,
+            name: "Inventory".into(),
+            type_default: -1,
+            ..Default::default()
+        }]);
+        let full = actions::FULL;
+        let asset = Uuid::from_u128(0x4199_000a);
+        let item = Uuid::from_u128(0x4199_0010);
+        world.inventory.add_items(vec![InvItem {
+            id: item,
+            parent: root,
+            asset_id: asset,
+            name: "Wood".into(),
+            inv_type: INV_TEXTURE,
+            asset_type: 0,
+            owner: agent,
+            owner_mask: full,
+            base_mask: full,
+            everyone_mask: full,
+            next_owner_mask: full,
+            group_mask: full,
+            ..Default::default()
+        }]);
+        let mut picker = TexturePicker::default();
+        picker.open_with_defaults("Texture", asset, None, false);
+        picker.set_tentative(true);
+        let mut ui = PickerUi::new();
+        ui.settle(|ctx, p| {
+            picker.show(ctx, p, &mut world, &HashMap::new());
+        });
+        assert_eq!(picker.selected_item, Some(item), "the current texture is highlighted");
+        assert!(!picker.tentative(), "the highlighted row enables OK");
+        assert!(picker.can_confirm(&world.inventory, agent));
+        assert!(picker.take_preview().is_none(), "highlighting is not a click");
+
+        // A no-transfer item on an object the agent does not own stays refused.
+        let restricted_asset = Uuid::from_u128(0x4199_000b);
+        let restricted = Uuid::from_u128(0x4199_0011);
+        world.inventory.add_items(vec![InvItem {
+            id: restricted,
+            parent: root,
+            asset_id: restricted_asset,
+            name: "No transfer".into(),
+            inv_type: INV_TEXTURE,
+            asset_type: 0,
+            owner: agent,
+            owner_mask: actions::COPY | actions::MODIFY,
+            base_mask: actions::COPY | actions::MODIFY,
+            ..Default::default()
+        }]);
+        picker.open_with_defaults("Texture", restricted_asset, None, false);
+        picker.owned_target = false;
+        picker.set_tentative(true);
+        ui.settle(|ctx, p| {
+            picker.show(ctx, p, &mut world, &HashMap::new());
+        });
+        assert_eq!(picker.selected_item, Some(restricted));
+        assert!(!picker.tentative());
+        assert!(picker.confirm_blocked(&world.inventory, agent));
+        assert!(!picker.can_confirm(&world.inventory, agent), "no-transfer still has no OK");
     }
 
     #[test]
