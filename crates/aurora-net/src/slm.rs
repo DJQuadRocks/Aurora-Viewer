@@ -170,6 +170,9 @@ pub enum SlmReply {
     NotFound,
     /// A failure, with what MerchantTransactionFailed shows.
     Failed(SlmError),
+    /// HTTP 429 or 503 on a listing request: try this listing again later.
+    /// GET /merchant uses [`merchant_status`]; 503 there stays NotMigrated.
+    RateLimited,
 }
 
 /// The alert of log_SLM_warning.
@@ -236,6 +239,11 @@ pub fn reply(request: &SlmRequest, code: u16, reason: &str, body: &Value) -> Slm
     }
     if code == 404 && matches!(request, SlmRequest::Listing { .. }) {
         return SlmReply::NotFound;
+    }
+    // Linden answers 429 and 503 when the listing API wants a pause.
+    // GET /merchant is read by merchant_status, not here.
+    if code == 429 || code == 503 {
+        return SlmReply::RateLimited;
     }
     SlmReply::Failed(error(code, reason, body))
 }
@@ -426,6 +434,15 @@ mod tests {
             reply(&SlmRequest::Listings, 200, "OK", &json!({"listings": []})),
             SlmReply::Listings(Vec::new())
         );
+        let create = SlmRequest::Create {
+            folder: id(1),
+            name: "Chair".into(),
+            version: Uuid::nil(),
+            count: -1,
+        };
+        assert_eq!(reply(&create, 429, "Too Many Requests", &Value::Null), SlmReply::RateLimited);
+        assert_eq!(reply(&create, 503, "Service Unavailable", &Value::Null), SlmReply::RateLimited);
+        assert_eq!(reply(&create, 200, "OK", &json!({"listings": []})), SlmReply::Listings(Vec::new()));
     }
 
     #[test]

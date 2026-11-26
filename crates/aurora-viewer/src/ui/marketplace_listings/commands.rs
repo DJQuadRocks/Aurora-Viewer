@@ -299,7 +299,16 @@ impl ListingsUi {
             return;
         }
         match command {
-            Command::Create => self.create_listing(inv, worn, root, id, actions),
+            Command::Create => {
+                // One Create stays immediate, as the Legacy Viewer does it.
+                // While a batch is in flight, or the pause after one has not
+                // elapsed, this folder waits its turn.
+                if self.creates.accepts_immediate(std::time::Instant::now()) {
+                    self.create_listing(inv, worn, root, id, actions);
+                } else {
+                    self.creates.push([id]);
+                }
+            }
             Command::Associate => {
                 self.bring_up();
                 self.associate = Some((id, String::new()));
@@ -332,4 +341,23 @@ impl ListingsUi {
             }
         }
     }
+}
+
+/// Folders of a multi-selection whose Create listing command is enabled.
+/// One folder stays on the single Create path. A mixed selection does not.
+pub fn bulk_create_folders(commands: &std::collections::HashMap<Uuid, Vec<OptionState>>, ids: &[Uuid]) -> Vec<Uuid> {
+    if ids.len() < 2 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(options) = commands.get(id) else {
+            return Vec::new();
+        };
+        if !options.iter().any(|option| option.command == Command::Create && option.enabled) {
+            return Vec::new();
+        }
+        out.push(*id);
+    }
+    out
 }

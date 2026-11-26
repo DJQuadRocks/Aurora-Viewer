@@ -214,12 +214,17 @@ mod tests {
                     .expect("paste links")
                     .enabled
             );
-            assert!(
-                !catalog
-                    .entries
-                    .iter()
-                    .any(|entry| ["share", "marketplace-copy", "marketplace-move"].contains(&entry.id.as_str()))
-            );
+            assert!(!catalog.entries.iter().any(|entry| {
+                [
+                    "share",
+                    "marketplace-copy",
+                    "marketplace-move",
+                    "marketplace-copy-count",
+                    "marketplace-copy-create",
+                    "marketplace-move-create",
+                ]
+                .contains(&entry.id.as_str())
+            }));
             if inv.folders.contains_key(&id) {
                 for key in ["protect-folder", "reload", "show-window"] {
                     assert!(catalog.entries.iter().any(|entry| entry.id == key && entry.enabled), "{id}: {key}");
@@ -454,5 +459,58 @@ mod tests {
             }
             output.textures_delta.clear();
         }
+    }
+
+    #[test]
+    fn a_multi_selection_of_unassociated_folders_creates_them_together() {
+        let mut inv = inventory();
+        let root = crate::world::marketplace::root(&inv).expect("listings");
+        let extra = Uuid::from_u128(8_400_090);
+        inv.created_folders(vec![aurora_net::inventory::InvFolder {
+            id: extra,
+            parent: root,
+            name: "Spare".into(),
+            type_default: -1,
+            ..Default::default()
+        }]);
+        let mut listings = crate::ui::marketplace_listings::ListingsUi::default();
+        let mut slm = demo::DemoSlm::new(demo::Mode::Merchant);
+        listings.data.set_status(slm.merchant());
+        assert!(listings.data.fetch_contents(root));
+        let now = std::time::Instant::now();
+        for request in listings.data.take_requests(now) {
+            let reply = slm.answer(&request);
+            listings.data.apply(&inv, root, &request, reply, now);
+        }
+        let prefs = InventoryPreferences::default();
+        let facts = Facts::default();
+        let mut state = InventoryUi {
+            ui_id: PANEL,
+            selected: Some(demo::LANTERN),
+            ..Default::default()
+        };
+        state.selection.extend([demo::LANTERN, extra]);
+        for id in [demo::LANTERN, extra, demo::HOODIE] {
+            state.marketplace_commands.insert(id, listings.inventory_commands(&inv, root, id));
+        }
+        let catalog = context_catalog::build(&inv, demo::LANTERN, &state, &prefs, &facts);
+        let entry = catalog.entries.iter().find(|entry| entry.id == "listing-create").expect("create");
+        assert!(entry.enabled);
+        let super::menu_layout::Kind::Action(index) = entry.kind else {
+            panic!("action")
+        };
+        match catalog.commands[index].as_ref() {
+            Some(context_catalog::Command::Invoke(InvAction::MarketplaceCreate(ids))) => {
+                assert_eq!(ids.len(), 2);
+                assert!(ids.contains(&demo::LANTERN) && ids.contains(&extra));
+            }
+            _ => panic!("bulk create"),
+        }
+        state.selection.clear();
+        state.selection.extend([demo::LANTERN, demo::HOODIE]);
+        let mixed = context_catalog::build(&inv, demo::LANTERN, &state, &prefs, &facts);
+        let mixed = mixed.entries.iter().find(|entry| entry.id == "listing-create").expect("create");
+        assert!(!mixed.enabled, "a listed folder keeps Create on the single path");
+        assert!(crate::ui::marketplace_listings::bulk_create_folders(&state.marketplace_commands, &[demo::LANTERN]).is_empty());
     }
 }

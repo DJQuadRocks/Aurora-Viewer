@@ -792,6 +792,16 @@ impl App {
                 }
             }
             InvAction::Marketplace(item, command) => self.inventory_marketplace_command(item, command),
+            InvAction::MarketplaceTransfer {
+                ids,
+                copy,
+                count,
+                create_listings,
+            } => self.start_marketplace_transfer(ids, copy, count, create_listings),
+            InvAction::MarketplaceCreate(ids) => {
+                self.listings_ui.creates.push(ids);
+                self.listings_ui.open = true;
+            }
             InvAction::ShowMain(item) => {
                 let inv = &self.world.inventory;
                 let pane = pane_of(&mut self.inventory_ui, &mut self.dual_inventory_ui, editor);
@@ -907,15 +917,22 @@ impl App {
     pub(super) fn inventory_result(&mut self, request: Uuid, result: Result<aurora_net::inventory::operations::Reply, String>) {
         if let Some(refresh) = self.inventory_ui.finish_copy(request, result.is_ok()) {
             // the copies arrived: the step holds them now
+            let ok = result.is_ok();
             let created = result.as_ref().map(|reply| reply.created.clone()).unwrap_or_default();
-            self.world.inventory.changed(request, result.is_ok(), &created);
+            self.world.inventory.changed(request, ok, &created);
             if let Err(reason) = result {
-                self.inventory_ui.message = reason;
+                self.inventory_ui.message.clone_from(&reason);
+                if self.listings_ui.copy_pump.on_failure(request) {
+                    self.listings_ui.message = reason;
+                }
                 for id in refresh {
                     if let Some(folder) = self.world.inventory.folders.get(&id) {
                         self.world.inventory.queue.push((id, folder.library));
                     }
                 }
+            } else {
+                let landed = self.listings_ui.copy_pump.on_copies_finished(request);
+                self.marketplace_copy_landed(landed);
             }
             for w in &mut self.inventory_ui.windows {
                 w.state.message.clone_from(&self.inventory_ui.message);
@@ -939,6 +956,9 @@ impl App {
                 }
                 self.inventory_ui.watch_copy(request, &reply);
                 self.world.inventory.undo.created(request, &reply.created);
+                let created = reply.created.clone();
+                let landed = self.listings_ui.copy_pump.on_reply(request, true, &created);
+                self.marketplace_copy_landed(landed);
                 self.send(NetCommand::FinishInventoryCopies { request, reply });
                 return;
             }
@@ -969,6 +989,14 @@ impl App {
         // once the inventory holds it
         let created = result.as_ref().map(|reply| reply.created.clone()).unwrap_or_default();
         self.world.inventory.changed(request, result.is_ok(), &created);
+        if result.is_ok() {
+            let landed = self.listings_ui.copy_pump.on_reply(request, false, &created);
+            self.marketplace_copy_landed(landed);
+        } else if self.listings_ui.copy_pump.on_failure(request)
+            && let Err(reason) = &result
+        {
+            self.listings_ui.message.clone_from(reason);
+        }
         match result {
             Ok(reply) => {
                 if crate::world::appearance::cof(&self.world.inventory).is_some_and(|id| self.inventory_ui.pending_refresh.contains(&id)) {

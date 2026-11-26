@@ -149,18 +149,23 @@ pub(super) fn build(c: &mut Catalog, inv: &Inventory, id: Uuid, st: &InventoryUi
             Direction::Vertical,
             false,
         );
+        let bulk = crate::ui::marketplace_listings::bulk_create_folders(&st.marketplace_commands, &ids);
         for command in crate::ui::marketplace_listings::Command::ALL {
-            if all || listing_options.is_some_and(|options| options.iter().any(|option| option.command == command)) {
-                c.invoke(
-                    command.id(),
-                    &zone,
-                    command.icon(),
-                    command.label(),
+            let together = command == crate::ui::marketplace_listings::Command::Create && !bulk.is_empty();
+            if all || together || listing_options.is_some_and(|options| options.iter().any(|option| option.command == command)) {
+                let enabled = if together {
+                    ready
+                } else {
                     single
                         && ready
-                        && listing_options.is_some_and(|options| options.iter().any(|option| option.command == command && option.enabled)),
-                    InvAction::Marketplace(id, command),
-                );
+                        && listing_options.is_some_and(|options| options.iter().any(|option| option.command == command && option.enabled))
+                };
+                let action = if together {
+                    InvAction::MarketplaceCreate(bulk.clone())
+                } else {
+                    InvAction::Marketplace(id, command)
+                };
+                c.invoke(command.id(), &zone, command.icon(), command.label(), enabled, action);
             }
         }
     }

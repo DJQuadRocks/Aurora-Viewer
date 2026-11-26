@@ -6,6 +6,102 @@ use crate::ui::widgets::{self, Floater, Modal, flat_button};
 use aurora_llsd::llsd_map;
 use aurora_net::inventory::operations::Operation;
 
+/// "Copy to Marketplace listings…": a count from 1 to 100, and whether each
+/// new folder then gets an unlisted listing.
+pub(super) struct MarketplaceCopyDialog {
+    pub ids: Vec<Uuid>,
+    pub count: String,
+    pub create_listings: bool,
+    pub error: bool,
+}
+
+fn show_marketplace_copies(ctx: &egui::Context, p: &Palette, st: &mut InventoryUi, actions: &mut Vec<InvAction>) {
+    let Some(mut dialog) = st.marketplace_copies.take() else {
+        return;
+    };
+    let mut answer = None;
+    Modal::new(egui::Id::unique(("marketplace_copy_count", st.ui_id))).show(ctx, |ui| {
+        ui.set_max_width(340.0);
+        ui.label(
+            RichText::new(aurora_i18n::tr!("marketplace-copy-count-title"))
+                .size(15.0)
+                .strong()
+                .color(p.ink),
+        );
+        ui.add_space(8.0);
+        ui.label(RichText::new(aurora_i18n::tr!("marketplace-copy-count-prompt")).color(p.ink));
+        let before = dialog.count.clone();
+        widgets::restricted_text_field(ui, true, &mut dialog.count, widgets::TextPolicy::Digits, |b, _| {
+            egui::TextEdit::singleline(b).desired_width(80.0)
+        });
+        dialog.count.truncate(3);
+        if dialog.count != before {
+            dialog.error = false;
+        }
+        ui.label(
+            RichText::new(if dialog.error {
+                aurora_i18n::tr!("marketplace-copy-count-invalid")
+            } else {
+                aurora_i18n::tr!("marketplace-copy-count-hint")
+            })
+            .size(11.0)
+            .color(if dialog.error { p.warn } else { p.muted }),
+        );
+        ui.add_space(8.0);
+        widgets::checkbox(
+            ui,
+            p,
+            &mut dialog.create_listings,
+            aurora_i18n::tr!("marketplace-copy-count-create"),
+        );
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if widgets::action_button(
+                ui,
+                p,
+                "copy-filled",
+                aurora_i18n::tr!("common-ok"),
+                widgets::ActionKind::Primary,
+                Vec2::new(0.0, 28.0),
+            )
+            .clicked()
+                || widgets::enter_pressed(ui)
+            {
+                answer = Some(true);
+            }
+            if widgets::action_button(
+                ui,
+                p,
+                "x",
+                aurora_i18n::tr!("common-cancel"),
+                widgets::ActionKind::Flat,
+                Vec2::new(0.0, 28.0),
+            )
+            .clicked()
+                || ui.input(|i| i.key_pressed(egui::Key::Escape))
+            {
+                answer = Some(false);
+            }
+        });
+    });
+    match answer {
+        None => st.marketplace_copies = Some(dialog),
+        Some(false) => {}
+        Some(true) => match crate::world::marketplace::copy_queue::parse_copy_count(&dialog.count) {
+            Ok(count) => actions.push(InvAction::MarketplaceTransfer {
+                ids: dialog.ids,
+                copy: true,
+                count,
+                create_listings: dialog.create_listings,
+            }),
+            Err(_) => {
+                dialog.error = true;
+                st.marketplace_copies = Some(dialog);
+            }
+        },
+    }
+}
+
 pub(super) fn show(
     ctx: &egui::Context,
     p: &Palette,
@@ -17,6 +113,7 @@ pub(super) fn show(
     images: &std::collections::HashMap<Uuid, egui::TextureHandle>,
     actions: &mut Vec<InvAction>,
 ) {
+    show_marketplace_copies(ctx, p, st, actions);
     let Some(mut dialog) = st.dialog.take() else {
         return;
     };

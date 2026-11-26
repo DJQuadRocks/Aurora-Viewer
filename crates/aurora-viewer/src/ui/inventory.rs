@@ -286,6 +286,15 @@ pub enum InvAction {
         copy: bool,
     },
     Marketplace(Uuid, crate::ui::marketplace_listings::Command),
+    /// Several copies, or one copy or move, then optional listing creation.
+    MarketplaceTransfer {
+        ids: Vec<Uuid>,
+        copy: bool,
+        count: u32,
+        create_listings: bool,
+    },
+    /// Create a listing for each of these unassociated folders.
+    MarketplaceCreate(Vec<Uuid>),
     Profile(Uuid),
     /// The item image was copied; `clipboard`: its id is on the system
     /// clipboard too (the asset id rule allows it), else the copy stays in
@@ -868,6 +877,8 @@ pub struct InventoryUi {
     thumbnail_notice: Option<progress::Notice>,
     pub message: String,
     pub dialog: Option<EditDialog>,
+    /// "Copy to Marketplace listings…" : how many, and whether to create them.
+    marketplace_copies: Option<dialogs::MarketplaceCopyDialog>,
     folder_color: Option<folder_colors::Picker>,
     move_to: Option<move_to::MoveTo>,
     pub links_filter: Option<Uuid>,
@@ -1083,7 +1094,11 @@ impl InventoryUi {
 
     /// A dialog of this pane that stays on screen with the window closed.
     fn has_dialog(&self) -> bool {
-        self.dialog.is_some() || self.move_to.is_some() || self.thumbnail.item.is_some() || self.bulk_permissions.active()
+        self.dialog.is_some()
+            || self.marketplace_copies.is_some()
+            || self.move_to.is_some()
+            || self.thumbnail.item.is_some()
+            || self.bulk_permissions.active()
     }
 
     pub(crate) fn additional_open(&self) -> bool {
@@ -3117,6 +3132,7 @@ pub fn show(
     let shown = *open
         || dual.is_some()
         || st.dialog.is_some()
+        || st.marketplace_copies.is_some()
         || st.detach_delete.is_some()
         || st.move_to.is_some()
         || st.demo_menu.is_some()

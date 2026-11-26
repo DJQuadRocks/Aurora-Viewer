@@ -654,6 +654,27 @@ fn recursive_copy_requires_complete_contents_and_keeps_the_library_owner() {
 }
 
 #[test]
+fn three_marketplace_copies_stage_three_listing_folders() {
+    let mut inv = fixture();
+    let mut listings = Vec::new();
+    for _ in 0..3 {
+        let change = marketplace(&inv, &[id(8100)], true, &HashSet::new(), &HashSet::new()).expect("copy");
+        let root = system(&inv, 53).expect("listings");
+        let folders = crate::world::marketplace::copy_queue::staged_listing_folders(&change, Some(root));
+        assert_eq!(folders.len(), 1);
+        assert!(!listings.contains(&folders[0]));
+        listings.push(folders[0]);
+        demo_mutate(&mut inv, id(2), change).expect("reply");
+    }
+    let root = system(&inv, 53).unwrap();
+    for folder in listings {
+        assert_eq!(inv.folders[&folder].info.parent, root);
+        assert_eq!(inv.folders[&folder].info.type_default, -1);
+    }
+    assert!(inv.items.contains_key(&id(8100)), "the original stays");
+}
+
+#[test]
 fn marketplace_requires_transfer_and_stages_no_copy_objects_in_stock_folders() {
     let mut inv = fixture();
     assert!(marketplace(&inv, &[id(8110)], false, &HashSet::new(), &HashSet::new()).is_err());
