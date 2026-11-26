@@ -146,7 +146,7 @@ impl MediaManager {
             if !self.build_mode && o.click_action == crate::interaction::code::IGNORE {
                 continue;
             }
-            let Some((pos, rot, _)) = Scene::object_transform(world, idx, now, 0) else {
+            let Some((pos, rot, _)) = scene.click_pose(world, idx, now) else {
                 continue;
             };
             let model = Mat4::from_scale_rotation_translation(o.scale, rot, pos);
@@ -584,6 +584,79 @@ mod tests {
         // A touch script makes the transparent front face a deliberate clicker.
         world.objects.get_mut(front).unwrap().update_flags = crate::ui::context::flags::HANDLE_TOUCH;
         assert_eq!(press(&mut media, &world, &scene), front);
+    }
+
+    #[test]
+    fn a_moved_media_face_is_hit_where_it_was_on_the_click() {
+        let (mut world, mut scene, front, _) = crate::scene::picking::tests::scene_with_two_objects();
+        {
+            let o = world.objects.get_mut(front).unwrap();
+            o.position = Vec3::new(3.0, 0.0, 50.0);
+            o.rotation = glam::Quat::IDENTITY;
+            o.scale = Vec3::ONE;
+            o.velocity = Vec3::ZERO;
+            o.acceleration = Vec3::ZERO;
+            o.angular_velocity = Vec3::ZERO;
+            o.parent_id = 0;
+            o.click_action = crate::interaction::code::NONE;
+            o.update_flags = 0;
+        }
+        let id = world.objects.get(front).unwrap().full_id;
+        let cache_key = world.objects.get(front).unwrap().visual_volume().cache_key() ^ (3u64 << 60);
+        scene.gpu[front].lod = 3;
+        scene.gpu[front].center = world.objects.get(front).unwrap().position;
+        scene.gpu[front].radius = 1.0;
+        let mut media = MediaManager::default();
+        media.objects.insert(
+            id,
+            ObjMedia {
+                idx: front,
+                data: Some(ObjectMediaData {
+                    faces: vec![Some(MediaEntry {
+                        current_url: "https://example.invalid/media".into(),
+                        ..Default::default()
+                    })],
+                    ..Default::default()
+                }),
+                hud: false,
+                ..Default::default()
+            },
+        );
+        media.pick_cache.insert(
+            id,
+            (
+                cache_key,
+                Arc::new(vec![Some(CpuFace {
+                    positions: vec![[-0.5, -0.5, -0.5], [-0.5, 0.5, -0.5], [-0.5, 0.5, 0.5], [-0.5, -0.5, 0.5]],
+                    uvs: vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                    indices: vec![0, 2, 1, 0, 3, 2],
+                })]),
+            ),
+        );
+        if let Some(te) = world.objects.get_mut(front).unwrap().te.clone() {
+            let mut te = te.as_ref().clone();
+            for face in &mut te.faces {
+                face.color[3] = 1.0;
+            }
+            world.objects.get_mut(front).unwrap().te = Some(Arc::new(te));
+        }
+        let (pos, _, _) = Scene::object_transform(&world, front, std::time::Instant::now(), 0).unwrap();
+        let origin = pos - Vec3::new(2.0, 0.0, 0.0);
+        let hit = media
+            .hit_test(&world, &scene, origin, Vec3::X, None, false, None)
+            .expect("the face is under the cursor");
+        let frame = scene.capture_click_frame(&world, (origin, Vec3::X), &[front]);
+        world.objects.get_mut(front).unwrap().position.y += 2.0;
+        scene.click_frame = None;
+        assert!(
+            media.hit_test(&world, &scene, origin, Vec3::X, Some(hit.t), false, None).is_none(),
+            "the face has left the ray"
+        );
+        scene.click_frame = Some(frame);
+        assert!(
+            media.hit_test(&world, &scene, origin, Vec3::X, Some(hit.t), false, None).is_some(),
+            "the face is still where the click found it"
+        );
     }
 
     #[test]

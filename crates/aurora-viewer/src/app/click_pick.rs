@@ -15,7 +15,10 @@
 //! click used to wait).
 //! The click is then run again from its start with the answer in hand, the
 //! cursor and the modifiers as they were when it was made: same ray, same
-//! depth, same code as before, a few frames later.
+//! depth, and the objects where they were on that frame
+//! (`scene/click_frame.rs`), a few frames later. On a moving vehicle the
+//! switches leave the ray in those frames; searching them where they are
+//! now misses the click (#4088, #3312).
 //!
 //! As LLViewerWindow::pickAsync (LLToolCamera, the build tools) does with
 //! LLWindow::delayInputProcessing ("delay further event processing until
@@ -170,6 +173,8 @@ struct Pending {
     tags: Vec<(Uuid, Vec3)>,
     asked: Instant,
     frame: u64,
+    /// Where the objects the ray could meet stood when the click was made.
+    click_frame: Option<crate::scene::click_frame::ClickFrame>,
     /// AURORA_CLICK_PICK=check: the waiting read made at the click.
     check: Option<Check>,
 }
@@ -532,6 +537,10 @@ impl App {
         self.hover_drawn.cancel(&mut g.renderer);
         let drawn_ticket = g.renderer.request_drawn(x, y, mode);
         let tags = self.name_tag_candidates(ray);
+        let click_frame = ray.map(|ray| {
+            let extras: Vec<usize> = self.media.click_targets().collect();
+            self.scene.capture_click_frame(&self.world, ray, &extras)
+        });
         let check = check.map(|(depth, waited)| Check {
             depth,
             target: self.click_target(click, ray, depth),
@@ -551,6 +560,7 @@ impl App {
             tags,
             asked: Instant::now(),
             frame: self.frame_count,
+            click_frame,
             check,
         });
         None
@@ -657,9 +667,12 @@ impl App {
                     tag,
                     particles: p.particles,
                 });
+                // The search uses the objects of the click, not of this frame.
+                self.scene.click_frame = p.click_frame;
                 if p.click != Click::Press || !self.camera.mouselook() {
                     self.with_ordered_input(|app| app.run_click(p.click));
                 }
+                self.scene.click_frame = None;
                 self.clicks.in_hand = None;
                 (self.cursor_pos, [self.alt, self.ctrl, self.shift]) = now;
             }
@@ -1245,6 +1258,7 @@ mod tests {
             tags: Vec::new(),
             asked: Instant::now(),
             frame: 0,
+            click_frame: None,
             check: None,
         }
     }
@@ -1466,6 +1480,7 @@ mod tests {
             tags: Vec::new(),
             asked: Instant::now(),
             frame: 0,
+            click_frame: None,
             check: None,
         });
         w.hold(turn(3));

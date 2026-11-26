@@ -15108,7 +15108,10 @@ What the inventory must show with these scenarios:
   an fps cap, three when the GPU is the limit), and the click is then
   handled with the cursor and the keys it had; what follows it (release,
   other buttons, mouse movement that moves the camera) waits behind it, in
-  order (`app/click_pick.rs`).
+  order (`app/click_pick.rs`). The objects the ray could meet, and the
+  world media prims, are searched where they were on that frame
+  (`scene/click_frame.rs`), so a switch on a moving vehicle is still the
+  one under the cursor.
   - `wait`: the depth is read right away by waiting for the GPU, as before,
     to compare (without the read of the drawn faces: a rigged mesh is then
     not picked, as before too): in a scene where the GPU is the limit, the

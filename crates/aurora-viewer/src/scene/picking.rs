@@ -100,16 +100,7 @@ impl PickFace {
 /// meshes (sphere of the wearer, not of the bind pose) and objects without
 /// bounds yet always pass.
 pub(super) fn ray_may_hit(g: &super::ObjGpu, ray: (Vec3, Vec3)) -> bool {
-    if g.rigged || g.radius <= 0.0 {
-        return true;
-    }
-    let r = g.radius * 1.05 + 0.05;
-    let to = g.center - ray.0;
-    let along = to.dot(ray.1);
-    if along < -r {
-        return false;
-    }
-    to.length_squared() - along * along <= r * r
+    click_frame::sphere_meets_ray(g.center, g.radius, g.rigged, ray)
 }
 
 /// How far along a click's ray from `eye` the GPU draws `g` with the draw
@@ -1070,8 +1061,8 @@ impl Scene {
         }
         let key = geometry.or(g.geom)?;
         let geom = self.geom_ready(&key)?;
-        let (pos, rot, _) = Self::object_transform(world, idx, now, 0)?;
-        let model = self.drawn_model(g, o, world.visual_scale_at(idx, now), Some(key), pos, rot);
+        let (pos, rot, scale) = self.placed(world, idx, now)?;
+        let model = self.drawn_model(g, o, scale, Some(key), pos, rot);
         let inv = model.inverse();
         let counts = &self.exact_tests;
         counts.objects.fetch_add(1, Relaxed);
@@ -1382,8 +1373,8 @@ impl Scene {
         }
         let key = g.geom?;
         let geom = self.geom_ready(&key)?;
-        let (pos, rot, _) = Self::object_transform(world, idx, now, 0)?;
-        let model = self.drawn_model(g, o, world.visual_scale_at(idx, now), Some(key), pos, rot);
+        let (pos, rot, scale) = self.placed(world, idx, now)?;
+        let model = self.drawn_model(g, o, scale, Some(key), pos, rot);
         let inv = model.inverse();
         // (the ray in object space, as `pick::ray_faces` takes it there)
         let (origin, dir) = (inv.transform_point3(ray.0), inv.transform_vector3(ray.1));
@@ -1663,7 +1654,7 @@ impl Scene {
                     .objects
                     .get(idx)
                     .is_some_and(|o| o.click_action == crate::interaction::code::IGNORE && o.extra.reflection_probe.is_none())
-                && ray_may_hit(g, ray)
+                && self.may_hit(world, idx, g, ray)
                 && self.hit_distance(world, idx, ray, now, true, among).is_some_and(|t| t <= limit)
         })
     }
@@ -1697,7 +1688,7 @@ impl Scene {
             if g.faces.is_empty() || g.hud || o.extra.reflection_probe.is_some() || o.click_action == crate::interaction::code::IGNORE {
                 continue;
             }
-            if !g.is_avatar && !ray_may_hit(g, ray) {
+            if !g.is_avatar && !self.may_hit(world, idx, g, ray) {
                 continue;
             }
             let t = if g.is_avatar {
@@ -1793,7 +1784,7 @@ impl Scene {
                     avatar_center(world, idx, g) - Vec3::new(0.35, 0.35, 1.0),
                     avatar_center(world, idx, g) + Vec3::new(0.35, 0.35, 1.0),
                 )
-            } else if ray_may_hit(g, ray) {
+            } else if self.may_hit(world, idx, g, ray) {
                 self.face_hit_mode(world, idx, ray, now, clicker, FacePick::Left).map(|h| h.t)
             } else {
                 None
@@ -1852,7 +1843,7 @@ impl Scene {
                 || g.is_avatar
                 || o.extra.reflection_probe.is_some()
                 || o.click_action == crate::interaction::code::IGNORE
-                || !ray_may_hit(g, ray)
+                || !self.may_hit(world, idx, g, ray)
             {
                 continue;
             }
@@ -1957,6 +1948,82 @@ impl Scene {
         })
     }
 
+    /// Where an object stood when the click was made, if this search is
+    /// that click running again (`click_frame`).
+    fn frozen(&self, world: &World, idx: usize) -> Option<&click_frame::Pose> {
+        let id = world.objects.get(idx)?.full_id;
+        self.click_frame.as_ref()?.get(idx, id)
+    }
+
+    /// Position, rotation and scale of a pick: the click's, or where the
+    /// object is now.
+    fn placed(&self, world: &World, idx: usize, now: Instant) -> Option<(Vec3, glam::Quat, Vec3)> {
+        if let Some(pose) = self.frozen(world, idx) {
+            return Some((pose.pos, pose.rot, pose.scale));
+        }
+        let (pos, rot, _) = Self::object_transform(world, idx, now, 0)?;
+        Some((pos, rot, world.visual_scale_at(idx, now)))
+    }
+
+    /// The broad phase of a click. While a click runs again, the sphere is
+    /// the one from its frame: the bounds kept since then have moved with
+    /// the vehicle.
+    fn may_hit(&self, world: &World, idx: usize, g: &ObjGpu, ray: (Vec3, Vec3)) -> bool {
+        match self.frozen(world, idx) {
+            Some(pose) => click_frame::sphere_meets_ray(pose.center, pose.radius, g.rigged, ray),
+            None => ray_may_hit(g, ray),
+        }
+    }
+
+    fn pose_at(&self, world: &World, idx: usize, now: Instant) -> Option<click_frame::Pose> {
+        let o = world.objects.get(idx)?;
+        let g = self.gpu.get(idx)?;
+        let (pos, rot, _) = Self::object_transform(world, idx, now, 0)?;
+        Some(click_frame::Pose {
+            id: o.full_id,
+            pos,
+            rot,
+            scale: world.visual_scale_at(idx, now),
+            center: g.center,
+            radius: g.radius,
+        })
+    }
+
+    /// The objects a click could meet, placed as they are when the click is
+    /// made. `extra` are world media prims: their faces are tested on their
+    /// own, so their pose is kept even when the pick index did not list them.
+    pub(crate) fn capture_click_frame(&self, world: &World, ray: (Vec3, Vec3), extra: &[usize]) -> click_frame::ClickFrame {
+        let mut order = Vec::new();
+        self.pick.point_candidates(ray, None, &mut order);
+        let now = Instant::now();
+        let mut frame = click_frame::ClickFrame::from_indices(order, |idx| self.pose_at(world, idx, now));
+        for &idx in extra {
+            if let Some(pose) = self.pose_at(world, idx, now) {
+                frame.keep(idx, pose);
+            }
+        }
+        frame
+    }
+
+    /// Position and rotation of a media face: the click's, or the live one.
+    /// A pick-index object is not a HUD.
+    pub(crate) fn click_pose(&self, world: &World, idx: usize, now: Instant) -> Option<super::sync_sets::Xf> {
+        if let Some(pose) = self.frozen(world, idx) {
+            return Some((pose.pos, pose.rot, false));
+        }
+        Self::object_transform(world, idx, now, 0)
+    }
+
+    /// The objects a click searches. While it runs again, the list and the
+    /// order are the ones from its frame, not the bounds of this frame.
+    fn candidates_at_click(&self, world: &World, ray: (Vec3, Vec3), depth: Option<Vec3>, out: &mut Vec<usize>) {
+        if let Some(frame) = &self.click_frame {
+            frame.copy_live(|idx| world.objects.get(idx).map(|o| o.full_id), out);
+        } else {
+            self.pick.point_candidates(ray, depth, out);
+        }
+    }
+
     pub fn action_point(&self, world: &World, ray: Option<(Vec3, Vec3)>, depth: Option<Vec3>, build: bool, far: f32) -> Option<Vec3> {
         if build {
             return depth;
@@ -1966,10 +2033,13 @@ impl Scene {
         // steps walked every object of the region, 2 to 4 ms a click with
         // 23,000 of them, a spike in the frame graph at each click. Same
         // tests, same order, same answer (AURORA_HOVER_CHECK compares).
+        // A click running again searches the objects of its own frame
+        // (`click_frame`): comparing that list with every object now would
+        // warn about the motion the frame exists to keep.
         let mut candidates = Vec::new();
-        self.pick.point_candidates(ray, depth, &mut candidates);
+        self.candidates_at_click(world, ray, depth, &mut candidates);
         let point = self.action_point_among(world, ray, depth, far, Some(&candidates));
-        if super::hover::check_enabled() {
+        if self.click_frame.is_none() && super::hover::check_enabled() {
             let full = self.action_point_among(world, ray, depth, far, None);
             if full != point {
                 log::warn!("click index check: action point {point:?} from the index, {full:?} from every object");
@@ -1999,7 +2069,7 @@ impl Scene {
     /// ones. Keep the usual priority of scripted and transparent surfaces.
     pub fn drawn_action_point(&self, world: &World, ray: (Vec3, Vec3), depth: Option<Vec3>, far: f32) -> Option<Vec3> {
         let mut candidates = Vec::new();
-        self.pick.point_candidates(ray, depth, &mut candidates);
+        self.candidates_at_click(world, ray, depth, &mut candidates);
         self.left_action_surfaces(world, ray, depth, far, Some(&candidates))
     }
 
@@ -2096,7 +2166,7 @@ impl Scene {
                 || (g.owner_avatar.is_some() && o.visual_volume().is_mesh())
                 || o.extra.reflection_probe.is_some()
                 || o.click_action == crate::interaction::code::IGNORE
-                || !ray_may_hit(g, ray)
+                || !self.may_hit(world, idx, g, ray)
             {
                 return None;
             }
@@ -2143,9 +2213,9 @@ impl Scene {
         mode: FacePick,
     ) -> Option<usize> {
         let mut candidates = Vec::new();
-        self.pick.point_candidates(ray, Some(point), &mut candidates);
+        self.candidates_at_click(world, ray, Some(point), &mut candidates);
         let idx = self.interaction_at_ray_mode(world, point, ray, include_hidden, Some(&candidates), mode);
-        if super::hover::check_enabled() {
+        if self.click_frame.is_none() && super::hover::check_enabled() {
             let full = self.interaction_at_ray_mode(world, point, ray, include_hidden, None, mode);
             if full != idx {
                 log::warn!("click index check: object {idx:?} at {point:?} from the index, {full:?} from every object");
@@ -2235,16 +2305,20 @@ impl Scene {
             {
                 continue;
             }
-            if g.radius > 0.0 && g.center.distance_squared(point) > (g.radius + TOLERANCE).powi(2) {
+            let (center, radius) = self
+                .frozen(world, idx)
+                .map(|pose| (pose.center, pose.radius))
+                .unwrap_or((g.center, g.radius));
+            if radius > 0.0 && center.distance_squared(point) > (radius + TOLERANCE).powi(2) {
                 continue;
             }
             let Some(geom) = g.geom.and_then(|key| self.geom_ready(&key)) else {
                 continue;
             };
-            let Some((pos, rot, _)) = Self::object_transform(world, idx, now, 0) else {
+            let Some((pos, rot, scale)) = self.placed(world, idx, now) else {
                 continue;
             };
-            let inv = self.drawn_model(g, o, o.visual_scale_at(now), g.geom, pos, rot).inverse();
+            let inv = self.drawn_model(g, o, scale, g.geom, pos, rot).inverse();
             if !ray_box(inv.transform_point3(ray.0), inv.transform_vector3(ray.1), geom.min, geom.max).is_some_and(|t| t < nearest) {
                 continue;
             }
@@ -3386,6 +3460,75 @@ pub(crate) mod tests {
             scene.gpu[idx].faces.push(face);
         }
         (world, scene, front, back)
+    }
+
+    /// A switch on a linkset that moves between the click and the search.
+    /// The ray and the depth stay those of the click; the poses do too
+    /// (`click_frame`).
+    #[test]
+    fn a_click_on_a_moved_linkset_uses_the_pose_from_the_click() {
+        let (mut world, mut scene, child, root) = scene_with_two_objects();
+        let root_key = world.objects.get(root).unwrap().key;
+        {
+            let o = world.objects.get_mut(root).unwrap();
+            o.position = Vec3::new(0.0, 0.0, 50.0);
+            o.rotation = glam::Quat::IDENTITY;
+            o.scale = Vec3::ONE;
+            o.velocity = Vec3::ZERO;
+            o.acceleration = Vec3::ZERO;
+            o.angular_velocity = Vec3::ZERO;
+            o.parent_id = 0;
+        }
+        {
+            let o = world.objects.get_mut(child).unwrap();
+            o.position = Vec3::new(3.0, 0.0, 0.0);
+            o.rotation = glam::Quat::IDENTITY;
+            o.scale = Vec3::ONE;
+            o.velocity = Vec3::ZERO;
+            o.acceleration = Vec3::ZERO;
+            o.angular_velocity = Vec3::ZERO;
+            o.parent_id = root_key.local_id;
+            o.parent_region = root_key.region;
+            o.click_action = crate::interaction::code::TOUCH;
+        }
+        let now = Instant::now();
+        let (pos, _, _) = Scene::object_transform(&world, child, now, 0).unwrap();
+        let hit = pos + Vec3::new(-0.5, 0.0, 0.0);
+        let ray = (pos - Vec3::new(2.0, 0.0, 0.0), Vec3::X);
+        for idx in [child, root] {
+            let (center, _, _) = Scene::object_transform(&world, idx, now, 0).unwrap();
+            scene.gpu[idx].center = center;
+            scene.gpu[idx].radius = 1.0;
+            scene.gpu[idx].hud = false;
+            scene.gpu[idx].is_avatar = false;
+            scene.gpu[idx].rigged = false;
+            scene.pick.set(idx, super::super::hover::PickEntry::of(&scene.gpu[idx]));
+        }
+        assert_eq!(
+            scene.left_interaction_at_ray(&world, hit, ray, true),
+            Some(child),
+            "the click meets the switch before the linkset moves"
+        );
+        let frame = scene.capture_click_frame(&world, ray, &[]);
+        world.objects.get_mut(root).unwrap().position = Vec3::new(0.0, 2.0, 50.0);
+        let now = Instant::now();
+        for idx in [child, root] {
+            let (center, _, _) = Scene::object_transform(&world, idx, now, 0).unwrap();
+            scene.gpu[idx].center = center;
+            scene.pick.set(idx, super::super::hover::PickEntry::of(&scene.gpu[idx]));
+        }
+        scene.click_frame = None;
+        assert_ne!(
+            scene.left_interaction_at_ray(&world, hit, ray, true),
+            Some(child),
+            "where the switch is now, the click's ray misses it"
+        );
+        scene.click_frame = Some(frame);
+        assert_eq!(
+            scene.left_interaction_at_ray(&world, hit, ray, true),
+            Some(child),
+            "the poses from the click still meet the ray"
+        );
     }
 
     #[test]
