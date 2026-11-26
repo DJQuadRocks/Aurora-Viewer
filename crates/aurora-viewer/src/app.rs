@@ -13112,7 +13112,8 @@ impl App {
         // Aurora Weather: the feet set down in the lying snow this frame, kept
         // with the region's other footprints; only while snow falls or lies
         // (as the renderer's footprint map: in clear weather no avatar
-        // skeleton, prim scan or ground ray)
+        // skeleton, prim scan or ground ray). The prims of a moving linkset
+        // share one pass over the pick bounds.
         if self.weather_now.snow_footprints
             && self.weather_now.snow_settles
             && self.in_world()

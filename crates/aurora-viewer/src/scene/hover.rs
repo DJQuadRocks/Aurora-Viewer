@@ -51,6 +51,52 @@ use super::ObjGpu;
 use glam::Vec3;
 use std::time::{Duration, Instant};
 
+/// Whether `e` can meet the segment from `origin` along a unit `dir` for
+/// `far` metres: the candidate test with no depth point, and the bounds
+/// must reach the segment. A hit past `far` cannot change a search that
+/// already discards it.
+fn column_candidate(e: &PickEntry, origin: Vec3, dir: Vec3, far: f32) -> bool {
+    if !e.pickable() {
+        return false;
+    }
+    if e.always {
+        return true;
+    }
+    let to = e.center - origin;
+    let along = to.dot(dir);
+    let r = e.radius * 1.05 + 0.15;
+    along >= -r && along <= far + r && to.length_squared() - along * along <= r * r
+}
+
+/// Horizontal cell of a straight-down ray. The ray does not move in x or y,
+/// so an object's bounds can meet it only from a cell its radius reaches.
+fn column_cell(origin: Vec3, cell: f32) -> (i32, i32) {
+    ((origin.x / cell).floor() as i32, (origin.y / cell).floor() as i32)
+}
+
+/// The cell's square is farther from `center` than `reach` (with a millimetre
+/// of slack, so a sphere on the boundary is still tested exactly).
+fn column_cell_misses(cell: (i32, i32), center: Vec3, reach: f32, size: f32) -> bool {
+    let min_x = cell.0 as f32 * size;
+    let min_y = cell.1 as f32 * size;
+    let dx = if center.x < min_x {
+        min_x - center.x
+    } else if center.x > min_x + size {
+        center.x - (min_x + size)
+    } else {
+        0.0
+    };
+    let dy = if center.y < min_y {
+        min_y - center.y
+    } else if center.y > min_y + size {
+        center.y - (min_y + size)
+    } else {
+        0.0
+    };
+    let pad = reach + 1.0e-3;
+    dx * dx + dy * dy > pad * pad
+}
+
 /// A kept answer is searched again after this long whatever happened.
 pub const REFRESH: Duration = Duration::from_millis(100);
 
@@ -273,6 +319,76 @@ impl PickIndex {
     /// A separate query for inventory placement; do not disturb hover's watch.
     pub fn ray_candidates(&self, ray: (Vec3, Vec3), out: &mut Vec<usize>) {
         self.candidates(&Probe { ray, depth: None }, out);
+    }
+
+    /// The objects each straight-down ray must test, and how many sphere
+    /// tests that took.
+    ///
+    /// A ray is `(origin, unit -Z, far)`. `skip_skinned` leaves rigged
+    /// meshes out: the ground search drops them before any triangle test.
+    /// The answer for one ray matches [`Self::ray_candidates`] when `far`
+    /// reaches past every object and `skip_skinned` is false, except a
+    /// sphere that cannot meet the finite segment is left out (its hit
+    /// would be past `far`).
+    ///
+    /// Footprints under a moving linkset used to call that search once per
+    /// prim per frame, and the walk sat in the frame-setup step the profile
+    /// names `p_probes` even when the only reflection probe was the sky's.
+    /// The prims of one frame share this pass: each object is tested only
+    /// against the rays whose horizontal cell its bounds can reach. The
+    /// Legacy Viewer assigns reflection probes per spatial group
+    /// (`LLReflectionMapManager::update`) and does not rescan the scene per
+    /// prim of a vehicle; it has no footprint rays.
+    pub fn vertical_candidates(&self, rays: &[(Vec3, Vec3, f32)], skip_skinned: bool, out: &mut [Vec<usize>]) -> u64 {
+        let n = rays.len().min(out.len());
+        for slot in out.iter_mut().take(n) {
+            slot.clear();
+        }
+        if n == 0 {
+            return 0;
+        }
+        // A linkset fits in a few cells. An object far from all of them is
+        // rejected once, not once per prim.
+        const CELL: f32 = 8.0;
+        let mut cells: Vec<((i32, i32), Vec<usize>)> = Vec::new();
+        for (qi, ray) in rays.iter().enumerate().take(n) {
+            let cell = column_cell(ray.0, CELL);
+            if let Some(slot) = cells.iter_mut().find(|slot| slot.0 == cell) {
+                slot.1.push(qi);
+            } else {
+                cells.push((cell, vec![qi]));
+            }
+        }
+        let mut always = Vec::new();
+        let mut tests = 0u64;
+        for (i, e) in self.entries.iter().enumerate() {
+            if !e.pickable() || (skip_skinned && e.skinned) {
+                continue;
+            }
+            if e.always {
+                always.push(i);
+                continue;
+            }
+            let reach = e.radius * 1.05 + 0.15;
+            for (cell, queries) in &cells {
+                if column_cell_misses(*cell, e.center, reach, CELL) {
+                    continue;
+                }
+                for &qi in queries {
+                    tests += 1;
+                    let (origin, dir, far) = rays[qi];
+                    if column_candidate(e, origin, dir, far) {
+                        out[qi].push(i);
+                    }
+                }
+            }
+        }
+        if !always.is_empty() {
+            for slot in out.iter_mut().take(n) {
+                slot.extend_from_slice(&always);
+            }
+        }
+        tests
     }
 
     /// The objects near the ray or around `point` on it: those a click's
@@ -1127,6 +1243,120 @@ mod tests {
         assert_eq!(out.capacity(), capacity);
         assert_eq!(index.watch, Some(PROBE));
         assert!(!index.disturbed);
+    }
+
+    /// A linkset that moves near the camera used to scan every object once
+    /// per prim per frame (the footprints' ground rays). The shared pass
+    /// tests each object against the rays it can meet, and leaves out a
+    /// sphere the short segment cannot reach.
+    #[test]
+    fn moving_linkset_ground_columns_do_not_rescan_every_object() {
+        let mut index = PickIndex::default();
+        const FAR: usize = 4096;
+        const RAYS: usize = 512;
+        for i in 0..FAR {
+            // A busy scene, well away from the linkset.
+            let x = 800.0 + (i % 64) as f32 * 3.0;
+            let y = 800.0 + (i / 64) as f32 * 3.0;
+            index.set(i, sphere(x, y, 1.2));
+        }
+        // The ground and a few neighbours under the linkset.
+        index.set(FAR, sphere(0.2, 0.0, 1.0));
+        index.set(FAR + 1, sphere(-0.4, 0.3, 0.8));
+        index.set(FAR + 2, sphere(1.5, -0.2, 0.5));
+        // Directly under a ray, but past the short segment.
+        index.set(
+            FAR + 3,
+            PickEntry {
+                center: Vec3::new(0.0, 0.0, -12.0),
+                radius: 1.0,
+                always: false,
+                aside: false,
+                skinned: false,
+            },
+        );
+        // Avatars are tested whatever the ray; rigged meshes are not, for
+        // the ground search.
+        index.set(FAR + 4, always(3.0, 4.0));
+        index.set(
+            FAR + 5,
+            PickEntry {
+                center: Vec3::new(50.0, 50.0, 0.0),
+                radius: 2.5,
+                always: true,
+                aside: true,
+                skinned: true,
+            },
+        );
+        // A negative cell, so the grid is not only the origin quadrant.
+        index.set(FAR + 6, sphere(-12.0, -6.0, 1.0));
+
+        let mut rays = Vec::with_capacity(RAYS + 1);
+        for i in 0..RAYS {
+            let x = (i % 32) as f32 * 0.06 - 0.9;
+            let y = (i / 32) as f32 * 0.08 - 0.6;
+            rays.push((Vec3::new(x, y, 1.2), -Vec3::Z, 0.4));
+        }
+        rays.push((Vec3::new(-12.0, -6.0, 2.0), -Vec3::Z, 0.4));
+
+        let mut out = vec![Vec::new(); rays.len()];
+        let tests = index.vertical_candidates(&rays, true, &mut out);
+        let mut reference = vec![Vec::new(); rays.len()];
+        for (qi, &(origin, dir, far)) in rays.iter().enumerate() {
+            for (i, e) in index.entries.iter().enumerate() {
+                if e.skinned {
+                    continue;
+                }
+                if super::column_candidate(e, origin, dir, far) {
+                    reference[qi].push(i);
+                }
+            }
+            let mut got = out[qi].clone();
+            let mut expect = reference[qi].clone();
+            got.sort_unstable();
+            expect.sort_unstable();
+            assert_eq!(got, expect, "ray {qi}");
+        }
+        // The sphere 12 m down is on the infinite ray and off the segment.
+        let mut infinite = Vec::new();
+        index.ray_candidates((Vec3::new(0.0, 0.0, 1.2), -Vec3::Z), &mut infinite);
+        assert!(infinite.contains(&(FAR + 3)));
+        assert!(!out[0].contains(&(FAR + 3)));
+        // Rigged meshes are out of the ground search; an avatar is in it.
+        assert!(out.iter().all(|c| !c.contains(&(FAR + 5))));
+        assert!(out.iter().any(|c| c.contains(&(FAR + 4))));
+
+        // A long downward ray, rigged meshes included, matches the per-ray
+        // search. The grid is the ray's horizontal cell, so the direction
+        // is straight down, as the ground columns are.
+        let long = [
+            (Vec3::new(0.0, 0.0, 2.0), -Vec3::Z, 1.0e6),
+            (Vec3::new(0.2, -0.1, 4.0), -Vec3::Z, 1.0e6),
+            (Vec3::new(-12.0, -6.0, 1.0), -Vec3::Z, 1.0e6),
+        ];
+        let mut batched = vec![Vec::new(); long.len()];
+        index.vertical_candidates(&long, false, &mut batched);
+        for (qi, &(origin, dir, _)) in long.iter().enumerate() {
+            let mut one = Vec::new();
+            index.ray_candidates((origin, dir), &mut one);
+            let mut got = batched[qi].clone();
+            got.sort_unstable();
+            one.sort_unstable();
+            assert_eq!(got, one, "long ray {qi}");
+        }
+
+        let old = index.entries.len() * rays.len();
+        assert!(
+            tests.saturating_mul(8) < old as u64,
+            "a moving linkset rescanned the scene: {tests} sphere tests, one full scan per prim would be {old}"
+        );
+        // The shared pass on this scene is a few thousand sphere tests, not
+        // the two million of one scan per prim. Headroom keeps the bound
+        // from depending on the exact cell edges.
+        assert!(
+            tests < 20_000,
+            "shared pass still did {tests} sphere tests (a scan per prim is {old})"
+        );
     }
 
     fn sphere(x: f32, y: f32, r: f32) -> PickEntry {

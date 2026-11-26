@@ -583,31 +583,46 @@ impl Scene {
     }
 
     /// Aurora Weather: the height of the ground within `far` m straight below
-    /// `from`: the terrain, or an object's face that does not move (not an
-    /// avatar, a rigged mesh, nor what is physical or moving).
-    pub fn ground_below(&self, world: &World, from: Vec3, far: f32) -> Option<f32> {
-        let ray = (from, -Vec3::Z);
-        let mut candidates = Vec::new();
-        self.pick.ray_candidates(ray, &mut candidates);
+    /// each column: the terrain, or an object's face that does not move (not
+    /// an avatar, a rigged mesh, nor what is physical or moving). One pass
+    /// over the pick bounds for every column. A moving linkset used to scan
+    /// the whole index once per prim.
+    pub fn grounds_below(&self, world: &World, froms: &[(Vec3, f32)]) -> Vec<Option<f32>> {
+        let rays: Vec<(Vec3, Vec3, f32)> = froms.iter().map(|(from, far)| (*from, -Vec3::Z, *far)).collect();
+        let mut columns = vec![Vec::new(); rays.len()];
+        self.pick.vertical_candidates(&rays, true, &mut columns);
         let now = Instant::now();
-        let mut best = world.ground_height(from).filter(|h| *h <= from.z && from.z - *h <= far);
-        for idx in candidates {
-            let (Some(g), Some(o)) = (self.gpu.get(idx), world.objects.get(idx)) else {
-                continue;
-            };
-            if g.hud || g.rigged || g.physical || g.is_avatar || o.pcode != aurora_prim::params::LL_PCODE_VOLUME || !ray_may_hit(g, ray) {
-                continue;
-            }
-            if let Some(hit) = self.face_hit(world, idx, ray, now, false)
-                && hit.t.is_finite()
-                && hit.t >= 0.0
-                && hit.t <= far
-            {
-                let z = from.z - hit.t;
-                best = Some(best.map_or(z, |b| b.max(z)));
-            }
-        }
-        best
+        froms
+            .iter()
+            .zip(columns)
+            .map(|((from, far), candidates)| {
+                let ray = (*from, -Vec3::Z);
+                let mut best = world.ground_height(*from).filter(|h| *h <= from.z && from.z - *h <= *far);
+                for idx in candidates {
+                    let (Some(g), Some(o)) = (self.gpu.get(idx), world.objects.get(idx)) else {
+                        continue;
+                    };
+                    if g.hud
+                        || g.rigged
+                        || g.physical
+                        || g.is_avatar
+                        || o.pcode != aurora_prim::params::LL_PCODE_VOLUME
+                        || !ray_may_hit(g, ray)
+                    {
+                        continue;
+                    }
+                    if let Some(hit) = self.face_hit(world, idx, ray, now, false)
+                        && hit.t.is_finite()
+                        && hit.t >= 0.0
+                        && hit.t <= *far
+                    {
+                        let z = from.z - hit.t;
+                        best = Some(best.map_or(z, |b| b.max(z)));
+                    }
+                }
+                best
+            })
+            .collect()
     }
 
     /// LLToolPipette: sample the texture entry tint of the nearest volume face,
