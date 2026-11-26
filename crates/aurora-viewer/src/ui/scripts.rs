@@ -41,7 +41,6 @@ pub enum Action {
         request: Uuid,
         name: String,
     },
-    Paste(ScriptTarget),
     SettingsChanged,
     Save {
         request: Uuid,
@@ -726,18 +725,46 @@ impl Editors {
         }
     }
 
-    pub fn paste(&mut self, ctx: &egui::Context, target: ScriptTarget, text: &str) {
-        let Some(e) = self
-            .documents
-            .iter_mut()
-            .find(|e| e.target == target && e.can_edit && e.loaded && e.saving.is_none() && !e.tools.processed)
-        else {
-            return;
-        };
-        let id = egui::Id::unique((&format!("script_editor_{}_{}", target.object, target.item), "source_text"));
-        let [a, b] = editing::cursor(ctx, id).sorted_cursors();
-        if !editing::replace(ctx, id, &mut e.source, a.index.0..b.index.0, text) {
-            e.status = aurora_i18n::tr!("script-source-too-large").into();
+    /// Play a menu Paste (context menu, Edit menu, toolbar) into the focused
+    /// source. `clipboard` is the system clipboard, read at the start of the
+    /// frame, the same moment as Ctrl+V and as the notecard field menu
+    /// (`ui/text_menu.rs`). `\r\n` is folded to `\n` before the text is
+    /// queued as `Event::Paste`, which is the event Ctrl+V produces. The
+    /// Legacy Viewer's text editor pastes that clipboard from this menu
+    /// entry (LLTextEditor, indra/llui/lltexteditor.cpp).
+    pub fn prepare_paste(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput, mut clipboard: impl FnMut() -> Option<String>) {
+        for e in &mut self.documents {
+            if e.tools.paste_pending == 0 {
+                continue;
+            }
+            let editable = e.can_edit
+                && e.loaded
+                && e.saving.is_none()
+                && e.loading.is_none()
+                && !e.tools.processed
+                && !e.colors.active()
+                && !e.closed;
+            let id = egui::Id::unique((&format!("script_editor_{}_{}", e.target.object, e.target.item), "source_text"));
+            if !editable {
+                e.tools.paste_pending = 0;
+                continue;
+            }
+            if !ctx.memory(|m| m.has_focus(id)) {
+                e.tools.paste_pending -= 1;
+                if e.tools.paste_pending > 0 {
+                    ctx.memory_mut(|m| m.request_focus(id));
+                }
+                continue;
+            }
+            e.tools.paste_pending = 0;
+            let Some(text) = clipboard() else {
+                continue;
+            };
+            let text = text.replace("\r\n", "\n");
+            if text.is_empty() {
+                continue;
+            }
+            raw.events.push(egui::Event::Paste(text));
         }
     }
 
@@ -2387,5 +2414,128 @@ print(\"bye\")"
                 errors: vec![]
             })
         ));
+    }
+
+    fn pointer(ctx: &egui::Context, editors: &mut Editors, pos: egui::Pos2, button: egui::PointerButton, pressed: bool) {
+        frame(
+            ctx,
+            editors,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+    }
+
+    /// Right-click Paste in the source must insert the system clipboard the
+    /// way Ctrl+V does. The clipboard here is the text a later frame can
+    /// read: the click itself must not invent a newline, and `\r\n` from
+    /// outside the viewer folds to `\n`.
+    #[test]
+    fn context_menu_paste_inserts_external_clipboard_text_like_ctrl_v() {
+        let ctx = egui::Context::default();
+        let mut editors = Editors::default();
+        let t = target(41);
+        let original = "alpha\nbeta".to_owned();
+        let load = editors.open(t, "Paste".into(), true, true, 0).unwrap();
+        editors.loaded(load, t, Ok(original.clone()));
+        settle(&ctx, &mut editors);
+
+        let id = source_id(t);
+        let pos = ctx.read_response(id).expect("source field").rect.center();
+        pointer(&ctx, &mut editors, pos, egui::PointerButton::Secondary, true);
+        pointer(&ctx, &mut editors, pos, egui::PointerButton::Secondary, false);
+        // The popup is drawn from the frame after it opens. Take the Paste
+        // row that sits in that popup: an earlier galley with the same word
+        // is not the row the click has to hit.
+        let listed = frame(&ctx, &mut editors, vec![]);
+        let paste = aurora_i18n::tr!("script-edit-paste");
+        let popup = ctx.memory(|m| m.area_rect(id.with("popup")));
+        let rows: Vec<_> = listed
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(text) if text.galley.job.text == paste => Some(text.pos + text.galley.size() * 0.5),
+                _ => None,
+            })
+            .collect();
+        let menu_pos = rows
+            .iter()
+            .copied()
+            .rev()
+            .find(|at| popup.is_none_or(|rect| rect.contains(*at)))
+            .unwrap_or_else(|| panic!("Paste row missing; popup={popup:?} rows={rows:?}"));
+        frame(&ctx, &mut editors, vec![egui::Event::PointerMoved(menu_pos)]);
+        pointer(&ctx, &mut editors, menu_pos, egui::PointerButton::Primary, true);
+        pointer(&ctx, &mut editors, menu_pos, egui::PointerButton::Primary, false);
+        assert_eq!(
+            editors.documents[0].tools.paste_pending, 2,
+            "choosing Paste queues it for the next frame; popup={popup:?} at={menu_pos:?}"
+        );
+
+        assert_eq!(
+            editors.documents[0].source, original,
+            "choosing Paste must not insert a newline of its own"
+        );
+        let cursor = editing::cursor(&ctx, id);
+        let clipboard = "from outside\r\nline 2";
+        for _ in 0..3 {
+            let mut raw = egui::RawInput::default();
+            editors.prepare_paste(&ctx, &mut raw, || Some(clipboard.to_owned()));
+            frame(&ctx, &mut editors, raw.events);
+        }
+
+        let mut twin = Editors::default();
+        let t2 = target(42);
+        let load = twin.open(t2, "Ctrl+V".into(), true, true, 0).unwrap();
+        twin.loaded(load, t2, Ok(original));
+        settle(&ctx, &mut twin);
+        let twin_id = source_id(t2);
+        let mut state = egui::TextEdit::load_state(&ctx, twin_id).unwrap_or_default();
+        state.cursor.set_char_range(Some(cursor));
+        state.store(&ctx, twin_id);
+        ctx.memory_mut(|m| m.request_focus(twin_id));
+        frame(&ctx, &mut twin, vec![]);
+        let mut state = egui::TextEdit::load_state(&ctx, twin_id).unwrap_or_default();
+        state.cursor.set_char_range(Some(cursor));
+        state.store(&ctx, twin_id);
+        frame(&ctx, &mut twin, vec![egui::Event::Paste("from outside\nline 2".into())]);
+
+        assert_eq!(
+            editors.documents[0].source, twin.documents[0].source,
+            "context-menu Paste must match Ctrl+V, including text copied outside the viewer"
+        );
+        assert!(
+            editors.documents[0].source.contains("from outside\nline 2"),
+            "clipboard text missing: {:?}",
+            editors.documents[0].source
+        );
+    }
+
+    #[test]
+    fn menu_paste_is_refused_when_the_script_cannot_be_edited() {
+        let ctx = egui::Context::default();
+        let mut editors = Editors::default();
+        let read_only = target(43);
+        let load = editors.open(read_only, "Read only".into(), true, false, 0).unwrap();
+        editors.loaded(load, read_only, Ok("secret".into()));
+        editors.documents[0].tools.paste_pending = 2;
+        let processed = target(44);
+        let load = editors.open(processed, "Processed".into(), true, true, 0).unwrap();
+        editors.loaded(load, processed, Ok("source".into()));
+        editors.documents[1].tools.processed = true;
+        editors.documents[1].tools.paste_pending = 2;
+        let mut raw = egui::RawInput::default();
+        editors.prepare_paste(&ctx, &mut raw, || Some("from outside".into()));
+        assert!(raw.events.is_empty());
+        assert_eq!(editors.documents[0].source, "secret");
+        assert_eq!(editors.documents[1].source, "source");
+        assert_eq!(editors.documents[0].tools.paste_pending, 0);
+        assert_eq!(editors.documents[1].tools.paste_pending, 0);
     }
 }

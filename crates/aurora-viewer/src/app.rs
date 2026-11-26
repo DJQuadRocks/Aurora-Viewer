@@ -13749,6 +13749,10 @@ impl App {
             || egui_state.clipboard_text(),
             self.demo.then_some(self.frame_count),
         );
+        // Script editor Paste (context menu, Edit menu, toolbar) joins the
+        // notecard field menu: the system clipboard is read now, before the
+        // pass, and played as the same Event::Paste Ctrl+V sends.
+        self.script_editors.prepare_paste(&ctx, &mut raw, || egui_state.clipboard_text());
         let mut inventory_drop = Vec::new();
         let mut library_drop = None;
         let t_pass = Instant::now();
