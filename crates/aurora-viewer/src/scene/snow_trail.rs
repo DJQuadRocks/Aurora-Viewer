@@ -250,7 +250,9 @@ impl SnowTrails {
                 }
             }
         }
-        // what is physical or moving, prim by prim (not worn, not avatars)
+        // what is physical or moving, prim by prim (not worn, not avatars).
+        // One shared ground query: a scan per prim is what made a moving
+        // linkset spend the frame here.
         let moving: Vec<usize> = scene
             .gpu
             .iter()
@@ -259,6 +261,7 @@ impl SnowTrails {
             .map(|(idx, _)| idx)
             .collect();
         let mut seen_objects = HashSet::new();
+        let mut pending: Vec<(Mat4, Vec3)> = Vec::new();
         for idx in moving {
             let Some(o) = world.objects.get(idx) else {
                 continue;
@@ -281,10 +284,20 @@ impl SnowTrails {
             }
             scene.snow_trails.objects.insert(o.full_id, at);
             let m = Mat4::from_scale_rotation_translation(o.scale * 0.5, r, p);
+            // a hull too wide to press never reads the ground (same limit
+            // as the print)
+            if !object_may_press(m) {
+                continue;
+            }
             let half_height = (Mat3::from_mat4(m).transpose() * Vec3::Z).length();
             let under = p.z - half_height;
-            // the ground just below its underside (not itself: it moves)
-            let Some(ground) = scene.ground_below(world, Vec3::new(p.x, p.y, under + 0.05), OBJECT_DOWN + 0.05) else {
+            pending.push((m, Vec3::new(p.x, p.y, under + 0.05)));
+        }
+        let froms: Vec<(Vec3, f32)> = pending.iter().map(|(_, from)| (*from, OBJECT_DOWN + 0.05)).collect();
+        // the ground just below each underside (not the prim itself: it moves)
+        let grounds = scene.grounds_below(world, &froms);
+        for ((m, _), ground) in pending.into_iter().zip(grounds) {
+            let Some(ground) = ground else {
                 continue;
             };
             if let Some(print) = object_print(m, ground, fallen) {
@@ -322,8 +335,31 @@ fn object_print(m: Mat4, ground: f32, fallen: f32) -> Option<[f32; 8]> {
     oval_print(m, ground, OBJECT_DOWN, BODY_ABOVE, OBJECT_WIDEST, fallen)
 }
 
-fn oval_print(m: Mat4, ground: f32, down: f32, above: f32, widest: f32, fallen: f32) -> Option<[f32; 8]> {
+/// Whether a prim is small enough to press. A hull wider than this never
+/// prints, so it does not ask for the ground under it.
+fn object_may_press(m: Mat4) -> bool {
+    longest_level_half(m).is_some_and(|half| half <= OBJECT_WIDEST)
+}
+
+/// Half the prim's reach along its longest level axis (the print's length).
+fn longest_level_half(m: Mat4) -> Option<f32> {
     if !m.is_finite() {
+        return None;
+    }
+    let axes = Mat3::from_mat4(m);
+    let level = [axes.x_axis.truncate(), axes.y_axis.truncate(), axes.z_axis.truncate()];
+    let long = level
+        .iter()
+        .copied()
+        .max_by(|a, b| a.length_squared().total_cmp(&b.length_squared()))?;
+    let along = long.normalize_or_zero();
+    let reach = |d: glam::Vec2| level.iter().map(|v| v.dot(d) * v.dot(d)).sum::<f32>().sqrt();
+    Some(reach(along))
+}
+
+fn oval_print(m: Mat4, ground: f32, down: f32, above: f32, widest: f32, fallen: f32) -> Option<[f32; 8]> {
+    let half_length = longest_level_half(m)?;
+    if half_length > widest {
         return None;
     }
     let axes = Mat3::from_mat4(m);
@@ -345,10 +381,6 @@ fn oval_print(m: Mat4, ground: f32, down: f32, above: f32, widest: f32, fallen: 
     let along = long.normalize_or_zero();
     let across = glam::Vec2::new(-along.y, along.x);
     let reach = |d: glam::Vec2| level.iter().map(|v| v.dot(d) * v.dot(d)).sum::<f32>().sqrt();
-    let half_length = reach(along);
-    if half_length > widest {
-        return None;
-    }
     let half_length = half_length.max(0.04);
     let width = (reach(across) / half_length).clamp(0.3, 1.0);
     Some([centre.x, centre.y, along.y.atan2(along.x), half_length, under, fallen, above, width])
@@ -387,6 +419,8 @@ mod tests {
         // a 10 m hull on the water: too wide to press
         let hull = Mat4::from_scale_rotation_translation(Vec3::new(5.0, 1.5, 1.0), glam::Quat::IDENTITY, Vec3::new(0.0, 0.0, 11.0));
         assert!(object_print(hull, 10.0, 1.0).is_none());
+        assert!(!object_may_press(hull));
+        assert!(object_may_press(ball));
     }
 
     #[test]
