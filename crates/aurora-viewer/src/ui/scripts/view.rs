@@ -47,6 +47,10 @@ pub(super) struct Tools {
     incoming_external: bool,
     pub diagnostics_processed: bool,
     pub reset_history: bool,
+    /// Frames left to play a menu Paste into the source (`0` means none).
+    /// The click that chooses Paste takes the keyboard, so the text is
+    /// applied on a later frame, once the source has it again.
+    pub(super) paste_pending: u8,
     footer_height: f32,
     can_undo: bool,
     can_redo: bool,
@@ -187,7 +191,16 @@ fn run(
                 editing::replace(ctx, id, &mut e.source, a.index.0..b.index.0, "");
             }
         }
-        Command::Paste => actions.push(Action::Paste(e.target)),
+        // The click takes the keyboard from the source. The system clipboard
+        // is read on a later frame and applied as Event::Paste, the same
+        // event Ctrl+V produces (`Editors::prepare_paste`). The Legacy
+        // Viewer's text editor pastes from that clipboard on this entry
+        // (LLTextEditor, indra/llui/lltexteditor.cpp). Reading it during
+        // the click drops text copied outside the viewer.
+        Command::Paste => {
+            ctx.memory_mut(|m| m.request_focus(id));
+            e.tools.paste_pending = 2;
+        }
         Command::SelectAll => editing::select(ctx, id, 0..text(e).chars().count(), true),
         Command::Deselect => {
             let at = editing::cursor(ctx, id).primary.index.0;
