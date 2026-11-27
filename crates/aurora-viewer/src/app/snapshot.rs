@@ -2772,6 +2772,9 @@ LUT_3D_SIZE {n}
             return true;
         }
         if self.camera.free().is_some() {
+            if crate::snapshot::viewfinder::escape_resets_camera(self.panels.snapshot, self.director.free) {
+                return false;
+            }
             self.snapshots.ui.free.on = false;
             self.photo_free_camera();
             return true;
