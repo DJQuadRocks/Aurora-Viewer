@@ -1373,6 +1373,12 @@ impl Camera {
 
     /// handle_reset_view (Escape, "Reset camera").
     pub fn handle_reset_view(&mut self, agent: &mut AgentState, s: &CameraSettings) {
+        // The photo free camera draws in place of the follow camera. Leaving
+        // it up made Escape a no-op, and ending it without this reset
+        // glided back to the last shot (#5098).
+        if self.free.take().is_some() {
+            self.smoothing_stop = true;
+        }
         self.clear_avatar_pan();
         let vr_heading = (self.vr_mode == Some(VrView::Avatar)).then(|| self.vr_view(0.0).inverse().transform_vector3(Vec3::NEG_Z));
         if !s.reset_view_turns_avatar {
@@ -1623,6 +1629,26 @@ impl Camera {
     /// indra/newview/llagentcamera.cpp, originally LGPL 2.1).
     pub fn sit_camera_active(&self) -> bool {
         self.sit_camera.is_some()
+    }
+
+    /// A vehicle's sit camera or a scripted follow camera holds the view
+    /// (#5098). The photo mode must not replace it with the last shot:
+    /// that unlocks the vehicle's camera.
+    pub fn photo_camera_locked(&self, scripted: bool) -> bool {
+        scripted || self.sit_camera.is_some() || self.mode == CameraMode::Follow
+    }
+
+    /// The user has left the ordinary camera behind the avatar (an orbit,
+    /// a pitch, a zoom, a pan, the free camera, the flycam or mouselook).
+    /// Opening the photo mode keeps that view (#5098).
+    pub fn photo_camera_moved(&self) -> bool {
+        self.free.is_some()
+            || self.flycam.is_some()
+            || self.mouselook()
+            || !self.focus_on_avatar
+            || self.orbit_yaw.abs() > 1.0e-3
+            || self.pitch.abs() > 1.0e-3
+            || (self.zoom_fraction - 1.0).abs() > 1.0e-3
     }
 
     /// CameraConstraint: the plane the simulator keeps the camera in front of.
@@ -4638,6 +4664,46 @@ mod tests {
         assert!(!cam.frame_poser_joint(joint, PoserFraming::Joint, &mut w.agent, &s));
         assert!(cam.mouselook());
         assert_eq!((cam.focus_target, cam.focus_offset_target), before);
+    }
+
+    /// #5098: Escape after a photo left the free camera on the last shot.
+    /// The reset has to drop it and come back behind the avatar.
+    #[test]
+    fn issue_5098_escape_drops_a_photo_free_camera() {
+        let s = CameraSettings {
+            smoothing: 0.0,
+            ..Default::default()
+        };
+        let mut w = world_at(Vec3::new(128.0, 128.0, 25.0));
+        let mut cam = Camera::default();
+        assert!(cam.photo_camera_locked(true), "a scripted camera is locked");
+        assert!(!cam.photo_camera_locked(false));
+        cam.mode = CameraMode::Follow;
+        assert!(cam.photo_camera_locked(false), "a follow camera is locked");
+        cam.on_sit_response(Uuid::nil(), Vec3::new(1.0, 0.0, 2.0), Vec3::new(6.0, 0.0, 2.0), false);
+        assert!(cam.sit_camera_active());
+        assert!(cam.photo_camera_locked(false), "a vehicle sit camera is locked");
+
+        let mut cam = Camera::default();
+        settle(&mut cam, &mut w, &s);
+        let home = cam.position;
+        assert!(!cam.photo_camera_moved(), "the ordinary camera is not a moved one");
+        cam.set_view(Vec3::new(150.0, 140.0, 40.0), Vec3::new(128.0, 128.0, 26.0), &mut w.agent, &s);
+        assert!(cam.photo_camera_moved(), "leaving the avatar counts as moved");
+        cam.start_free(&mut w.agent, &s);
+        let shot = Vec3::new(160.0, 150.0, 45.0);
+        *cam.free_mut().expect("free") = FreeCamera::from_view(shot, Vec3::new(128.0, 128.0, 26.0));
+        cam.update(&mut w, &s, &frame(1.0 / 60.0));
+        assert!(cam.position.distance(shot) < 0.05, "the free camera draws the last shot");
+        cam.handle_reset_view(&mut w.agent, &s);
+        settle(&mut cam, &mut w, &s);
+        assert!(cam.free().is_none(), "Escape ends the free camera");
+        assert!(cam.focus_on_avatar());
+        assert!(
+            cam.position.distance(home) < 0.05,
+            "Escape is the camera behind the avatar, at {:?} not {home:?}",
+            cam.position
+        );
     }
 
     #[test]

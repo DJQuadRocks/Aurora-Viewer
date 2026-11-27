@@ -182,7 +182,8 @@ pub const KEPT_VIEW_MOVE_MAX: f64 = 4.0;
 /// The view the viewfinder had when it last closed, taken back at the next
 /// opening of the session, like its tilt (the human's request, 2026-11-18:
 /// leaving the photo mode to change a setting lost the framing), as long as
-/// the avatar has not moved away (`KEPT_VIEW_MOVE_MAX`). In global metres
+/// the avatar has not moved away (`KEPT_VIEW_MOVE_MAX`) and the camera is
+/// still the ordinary one behind it (`restore`, #5098). In global metres
 /// (`camera::presets::to_global`), so that it holds across a region
 /// crossing.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -220,6 +221,49 @@ impl KeptView {
     pub fn shown(eye: glam::Vec3, at: glam::Vec3, eye_now: glam::Vec3, at_now: glam::Vec3) -> bool {
         eye.distance(eye_now) < 0.01 && at.distance(at_now) < 0.01
     }
+
+    /// The view to put back when the photo mode opens, or None when the
+    /// camera stays where it is.
+    ///
+    /// `back` only asks whether the avatar is still beside the old shot.
+    /// That put the last photo back over a camera the user had since moved,
+    /// and over a vehicle or a script that locks the camera: `set_view`
+    /// unlocks it, so the view jumps to the last shot (or, once that shot
+    /// is gone after a relog, onto the avatar) and Escape cannot return the
+    /// ordinary follow camera (#5098). A locked camera is never replaced.
+    /// A camera the user moved is replaced only when it is already showing
+    /// this shot. The ordinary camera behind an avatar that has not walked
+    /// away still takes the framing back, which is what leaving the photo
+    /// mode to change a setting is for.
+    pub fn restore(&self, origin: (u32, u32), avatar: glam::Vec3, reach: f32, open: OpenView) -> Option<(glam::Vec3, glam::Vec3)> {
+        if open.locked {
+            return None;
+        }
+        let (eye, at) = self.back(origin, avatar, reach)?;
+        if open.moved && !Self::shown(eye, at, open.eye, open.at) {
+            return None;
+        }
+        Some((eye, at))
+    }
+}
+
+/// Where the camera is as the photo mode opens.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OpenView {
+    pub eye: glam::Vec3,
+    pub at: glam::Vec3,
+    /// A vehicle's sit camera or a scripted follow camera holds the view.
+    pub locked: bool,
+    /// The user moved it off the ordinary camera behind the avatar.
+    pub moved: bool,
+}
+
+/// Escape with the photo window closed, and the Director not flying, is the
+/// normal camera reset. Spending that key to park a leftover free camera
+/// glided back to the last shot and the reset never ran (#5098). The open
+/// window still ends its own free camera, and the Director keeps its flight.
+pub fn escape_resets_camera(snapshot_open: bool, director_free: bool) -> bool {
+    !snapshot_open && !director_free
 }
 
 /// The tilt to take back at an opening: the one the viewfinder closed on
@@ -1274,6 +1318,77 @@ mod tests {
         assert!(KeptView::shown(eye, at, eye + Vec3::splat(0.001), at));
         assert!(!KeptView::shown(eye, at, eye + Vec3::X * 0.5, at), "the camera moved");
         assert!(!KeptView::shown(eye, at, eye, at + Vec3::Z), "it looks elsewhere");
+    }
+
+    #[test]
+    fn issue_5098_escape_after_the_photo_window_closes_resets() {
+        assert!(escape_resets_camera(false, false));
+        assert!(!escape_resets_camera(true, false), "the open window still ends its free camera");
+        assert!(!escape_resets_camera(false, true), "the Director keeps its free camera");
+    }
+
+    /// #5098: moving the camera, or a vehicle that locks it, then opening
+    /// the photo window jumped back to the last shot. `back` still finds
+    /// that shot (the avatar has not moved); `restore` must not use it.
+    #[test]
+    fn issue_5098_opening_keeps_a_moved_camera_and_a_vehicle_lock() {
+        use glam::Vec3;
+        let kept = KeptView {
+            eye: [256_010.0, 512_020.0, 25.0],
+            at: [256_012.0, 512_020.0, 24.5],
+            avatar: [256_013.0, 512_020.0, 22.0],
+            fov: 0.6,
+            free: true,
+        };
+        let origin = (256_000, 512_000);
+        let avatar = Vec3::new(13.0, 20.0, 22.0);
+        let shot = kept
+            .back(origin, avatar, 64.0)
+            .expect("the avatar stayed, so the old rule would jump");
+        let follow = OpenView {
+            eye: Vec3::new(8.0, 20.0, 24.0),
+            at: avatar + Vec3::Z,
+            locked: false,
+            moved: false,
+        };
+        assert_eq!(
+            kept.restore(origin, avatar, 64.0, follow),
+            Some(shot),
+            "the ordinary camera takes the framing back"
+        );
+        let moved = OpenView {
+            eye: Vec3::new(30.0, 40.0, 28.0),
+            at: Vec3::new(32.0, 40.0, 27.0),
+            locked: false,
+            moved: true,
+        };
+        assert!(kept.restore(origin, avatar, 64.0, moved).is_none(), "a camera the user moved stays");
+        let same = OpenView {
+            eye: shot.0,
+            at: shot.1,
+            locked: false,
+            moved: true,
+        };
+        assert_eq!(kept.restore(origin, avatar, 64.0, same), Some(shot), "already on the shot");
+        let locked = OpenView {
+            eye: Vec3::new(40.0, 10.0, 30.0),
+            at: Vec3::new(42.0, 10.0, 29.0),
+            locked: true,
+            moved: false,
+        };
+        assert!(kept.restore(origin, avatar, 64.0, locked).is_none(), "a vehicle lock stays");
+        // even when the locked camera happens to sit on the old shot
+        let locked_on_shot = OpenView {
+            eye: shot.0,
+            at: shot.1,
+            locked: true,
+            moved: false,
+        };
+        assert!(kept.restore(origin, avatar, 64.0, locked_on_shot).is_none());
+        assert!(
+            kept.restore(origin, Vec3::new(40.0, 20.0, 22.0), 64.0, follow).is_none(),
+            "walked away"
+        );
     }
 
     #[test]

@@ -71,9 +71,10 @@ impl App {
     /// the free camera again if it was. Not in mouselook, nor while RLVa
     /// holds the camera (as for a preset), nor past the draw distance (as
     /// for a place preset), nor once the avatar has moved away from where
-    /// it stood (#4604, `vf::KEPT_VIEW_MOVE_MAX`): the view stays where it
-    /// is then. Whether the view came back (its tilt follows it:
-    /// `vf::tilt_back`).
+    /// it stood (#4604, `vf::KEPT_VIEW_MOVE_MAX`), nor when the user has
+    /// since moved the camera or a vehicle or a script locks it (#5098,
+    /// `KeptView::restore`): the view stays where it is then. Whether the
+    /// view came back (its tilt follows it: `vf::tilt_back`).
     fn vf_view_back(&mut self) -> bool {
         let Some(kept) = self.snapshots.view_kept else {
             return false;
@@ -85,8 +86,14 @@ impl App {
             return false;
         };
         let reach = self.settings.draw_distance.max(64.0);
-        let Some((eye, at)) = kept.back(origin, self.world.agent.position, reach) else {
-            log::info!("viewfinder: the view it closed on is out of reach or the avatar moved, kept where it is");
+        let open = vf::OpenView {
+            eye: self.camera.position,
+            at: self.camera.target,
+            locked: self.camera.photo_camera_locked(self.world.scripted_camera.has_active()),
+            moved: self.camera.photo_camera_moved(),
+        };
+        let Some((eye, at)) = kept.restore(origin, self.world.agent.position, reach, open) else {
+            log::info!("viewfinder: the camera stays where it is");
             return false;
         };
         if kept.fov.is_finite() {

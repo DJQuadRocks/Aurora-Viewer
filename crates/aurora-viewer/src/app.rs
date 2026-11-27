@@ -3820,6 +3820,10 @@ impl App {
         self.record_inventory_logout();
         // the session's photo reel and its copies
         self.photo_reel_end();
+        // the photo mode's kept framing belongs to this session (#5098):
+        // a relog used to open on that shot, or on the avatar once the
+        // shot no longer matched the new region
+        self.snapshots.view_kept = None;
         if !self.demo {
             self.settings.release_hover_account();
         }
